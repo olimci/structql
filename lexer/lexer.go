@@ -43,6 +43,11 @@ func (l *Lexer) Next() token.Token {
 	case ')':
 		l.pos += width
 		return token.Token{Type: token.RParen, Literal: ")", Pos: start}
+	case '?':
+		l.pos += width
+		return token.Token{Type: token.Question, Literal: "?", Pos: start}
+	case '@':
+		return l.readNamedArg()
 	case '=':
 		l.pos += width
 		return token.Token{Type: token.Eq, Literal: "=", Pos: start}
@@ -83,7 +88,7 @@ func (l *Lexer) Next() token.Token {
 		return l.readString()
 	}
 
-	if unicode.IsLetter(ch) || ch == '_' {
+	if isIdentifierStart(ch) {
 		return l.readIdentifierOrKeyword()
 	}
 
@@ -180,7 +185,7 @@ func (l *Lexer) readIdentifierOrKeyword() token.Token {
 		if ch == utf8.RuneError && width == 1 {
 			break
 		}
-		if !unicode.IsLetter(ch) && !unicode.IsDigit(ch) && ch != '_' {
+		if !isIdentifierPart(ch) {
 			break
 		}
 		l.pos += width
@@ -208,4 +213,40 @@ func (l *Lexer) readNumber() token.Token {
 	}
 	lit := l.input[start:l.pos]
 	return token.Token{Type: token.Number, Literal: string(lit), Pos: start}
+}
+
+func (l *Lexer) readNamedArg() token.Token {
+	start := l.pos
+	_, width := l.current()
+	l.pos += width
+	if l.pos >= len(l.input) {
+		return token.Token{Type: token.Illegal, Literal: "@", Pos: start}
+	}
+	ch, chWidth := l.current()
+	if ch == utf8.RuneError && chWidth == 1 {
+		l.pos += chWidth
+		return token.Token{Type: token.Illegal, Literal: l.input[start:l.pos], Pos: start}
+	}
+	if !isIdentifierStart(ch) {
+		return token.Token{Type: token.Illegal, Literal: "@", Pos: start}
+	}
+	for l.pos < len(l.input) {
+		ch, width := l.current()
+		if ch == utf8.RuneError && width == 1 {
+			break
+		}
+		if !isIdentifierPart(ch) {
+			break
+		}
+		l.pos += width
+	}
+	return token.Token{Type: token.NamedArg, Literal: l.input[start:l.pos], Pos: start}
+}
+
+func isIdentifierStart(ch rune) bool {
+	return unicode.IsLetter(ch) || ch == '_'
+}
+
+func isIdentifierPart(ch rune) bool {
+	return unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_'
 }

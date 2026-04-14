@@ -41,11 +41,17 @@ func (t *Table) Len() int {
 }
 
 type DB struct {
-	tables map[string]*Table
+	tables    map[string]*Table
+	functions map[string]ScalarFunction
 }
 
 func NewDB() *DB {
-	return &DB{tables: make(map[string]*Table)}
+	db := &DB{
+		tables:    make(map[string]*Table),
+		functions: make(map[string]ScalarFunction),
+	}
+	db.registerBuiltinFunctions()
+	return db
 }
 
 type tableColumn interface {
@@ -89,5 +95,22 @@ func (c nullableColumn[T]) ValueAt(i int) any {
 }
 
 func (c nullableColumn[T]) Column() Column {
+	return c.def
+}
+
+type anyColumn struct {
+	def  Column
+	data []any
+}
+
+func (c anyColumn) Len() int {
+	return len(c.data)
+}
+
+func (c anyColumn) ValueAt(i int) any {
+	return c.data[i]
+}
+
+func (c anyColumn) Column() Column {
 	return c.def
 }

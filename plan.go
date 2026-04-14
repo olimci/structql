@@ -466,6 +466,7 @@ func (n *aggregateNode) execute(outer []Row) (*relation, error) {
 
 type plannerContext struct {
 	db         *DB
+	args       *queryArgs
 	outer      [][]relationColumn
 	captured   map[string]outerRef
 	captureSeq []outerRef
@@ -477,9 +478,10 @@ type outerRef struct {
 	col   relationColumn
 }
 
-func newPlannerContext(db *DB, outer [][]relationColumn) *plannerContext {
+func newPlannerContext(db *DB, outer [][]relationColumn, args *queryArgs) *plannerContext {
 	return &plannerContext{
 		db:       db,
+		args:     args,
 		outer:    outer,
 		captured: make(map[string]outerRef),
 	}
@@ -494,9 +496,23 @@ func (p *plannerContext) recordOuterRef(ref outerRef) {
 	p.captureSeq = append(p.captureSeq, ref)
 }
 
-func planQuery(db *DB, query *ast.Query) (planNode, error) {
-	ctx := newPlannerContext(db, nil)
-	return planQueryWithContext(ctx, query)
+func planQuery(db *DB, query *ast.Query, args []any) (planNode, error) {
+	parsedArgs, err := parseQueryArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	ctx := newPlannerContext(db, nil, parsedArgs)
+	plan, err := planQueryWithContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(parsedArgs.usedPos) != len(parsedArgs.positional) {
+		return nil, fmt.Errorf("expected %d positional query args but used %d placeholders", len(parsedArgs.positional), len(parsedArgs.usedPos))
+	}
+	if len(parsedArgs.usedNamed) != len(parsedArgs.named) {
+		return nil, fmt.Errorf("expected %d named query args but used %d placeholders", len(parsedArgs.named), len(parsedArgs.usedNamed))
+	}
+	return plan, nil
 }
 
 func planQueryWithContext(ctx *plannerContext, query *ast.Query) (planNode, error) {
@@ -580,7 +596,7 @@ func planNonAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query
 	}
 
 	if query.Limit != nil {
-		limit, err := parseLimit(query.Limit)
+		limit, err := parseLimit(ctx, query.Limit, input.schema())
 		if err != nil {
 			return nil, err
 		}
@@ -665,7 +681,7 @@ func planAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query) (
 
 	var limit *int
 	if query.Limit != nil {
-		parsed, err := parseLimit(query.Limit)
+		parsed, err := parseLimit(ctx, query.Limit, input.schema())
 		if err != nil {
 			return nil, err
 		}
@@ -685,7 +701,7 @@ func planAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query) (
 
 func planTableRef(ctx *plannerContext, ref ast.TableRef) (planNode, error) {
 	if ref.Subquery != nil {
-		childCtx := newPlannerContext(ctx.db, nil)
+		childCtx := newPlannerContext(ctx.db, nil, ctx.args)
 		child, err := planQueryWithContext(childCtx, ref.Subquery)
 		if err != nil {
 			return nil, err
@@ -740,19 +756,40 @@ func bindOrderExpr(ctx *plannerContext, expr ast.Expr, schema []relationColumn, 
 	return bindExpr(ctx, expr, schema)
 }
 
-func parseLimit(expr ast.Expr) (int, error) {
-	number, ok := expr.(ast.NumberLiteral)
-	if !ok {
-		return 0, fmt.Errorf("LIMIT currently requires a numeric literal")
+func parseLimit(ctx *plannerContext, expr ast.Expr, schema []relationColumn) (int, error) {
+	switch expr := expr.(type) {
+	case ast.NumberLiteral:
+		limit, err := strconv.Atoi(expr.Raw)
+		if err != nil {
+			return 0, fmt.Errorf("invalid LIMIT %q", expr.Raw)
+		}
+		if limit < 0 {
+			return 0, fmt.Errorf("LIMIT cannot be negative")
+		}
+		return limit, nil
+	case ast.PlaceholderExpr, ast.NamedPlaceholderExpr:
+		bound, err := bindExpr(ctx, expr, schema)
+		if err != nil {
+			return 0, err
+		}
+		value, err := bound.Eval(evalContext{})
+		if err != nil {
+			return 0, err
+		}
+		limit, ok := asInt64(value)
+		if !ok {
+			if value == nil {
+				return 0, fmt.Errorf("LIMIT placeholder cannot be nil")
+			}
+			return 0, fmt.Errorf("LIMIT placeholder must be an integer, got %T", value)
+		}
+		if limit < 0 {
+			return 0, fmt.Errorf("LIMIT cannot be negative")
+		}
+		return int(limit), nil
+	default:
+		return 0, fmt.Errorf("LIMIT currently requires a numeric literal or placeholder")
 	}
-	limit, err := strconv.Atoi(number.Raw)
-	if err != nil {
-		return 0, fmt.Errorf("invalid LIMIT %q", number.Raw)
-	}
-	if limit < 0 {
-		return 0, fmt.Errorf("LIMIT cannot be negative")
-	}
-	return limit, nil
 }
 
 func projectionName(item ast.SelectItem, idx int) string {
@@ -818,6 +855,16 @@ func (e literalExpr) Eval(evalContext) (any, error) { return e.value, nil }
 func (e literalExpr) Type() reflect.Type            { return e.typ }
 func (e literalExpr) Nullable() bool                { return e.nullable }
 
+type argExpr struct {
+	value any
+	typ   reflect.Type
+	null  bool
+}
+
+func (e argExpr) Eval(evalContext) (any, error) { return e.value, nil }
+func (e argExpr) Type() reflect.Type            { return e.typ }
+func (e argExpr) Nullable() bool                { return e.null }
+
 type columnExpr struct {
 	index int
 	col   relationColumn
@@ -848,6 +895,23 @@ func (e outerColumnExpr) Eval(ctx evalContext) (any, error) {
 }
 func (e outerColumnExpr) Type() reflect.Type { return e.ref.col.Type }
 func (e outerColumnExpr) Nullable() bool     { return e.ref.col.Nullable }
+
+type pathExpr struct {
+	base     boundExpr
+	path     []string
+	typ      reflect.Type
+	nullable bool
+}
+
+func (e pathExpr) Eval(ctx evalContext) (any, error) {
+	value, err := e.base.Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return traverseValuePath(value, e.path)
+}
+func (e pathExpr) Type() reflect.Type { return e.typ }
+func (e pathExpr) Nullable() bool     { return e.nullable }
 
 type unaryBoundExpr struct {
 	op    token.Type
@@ -1002,6 +1066,26 @@ func (e inBoundExpr) Eval(ctx evalContext) (any, error) {
 func (e inBoundExpr) Type() reflect.Type { return reflect.TypeFor[bool]() }
 func (e inBoundExpr) Nullable() bool     { return false }
 
+type scalarFunctionExpr struct {
+	name string
+	fn   ScalarFunction
+	args []boundExpr
+}
+
+func (e scalarFunctionExpr) Eval(ctx evalContext) (any, error) {
+	values := make([]any, len(e.args))
+	for i, arg := range e.args {
+		value, err := arg.Eval(ctx)
+		if err != nil {
+			return nil, err
+		}
+		values[i] = value
+	}
+	return e.fn.Eval(values)
+}
+func (e scalarFunctionExpr) Type() reflect.Type { return e.fn.ResultType }
+func (e scalarFunctionExpr) Nullable() bool     { return e.fn.Nullable }
+
 type scalarSubqueryExpr struct {
 	plan      planNode
 	typ       reflect.Type
@@ -1109,6 +1193,29 @@ func bindExpr(ctx *plannerContext, expr ast.Expr, schema []relationColumn) (boun
 		return literalExpr{value: expr.Value, typ: reflect.TypeFor[bool](), nullable: false}, nil
 	case ast.NullLiteral:
 		return literalExpr{value: nil, typ: nil, nullable: true}, nil
+	case ast.PlaceholderExpr:
+		if expr.Index < 0 || expr.Index >= len(ctx.args.positional) {
+			return nil, fmt.Errorf("missing query arg for placeholder %d", expr.Index+1)
+		}
+		value := ctx.args.positional[expr.Index]
+		ctx.args.usedPos[expr.Index] = struct{}{}
+		var typ reflect.Type
+		if value != nil {
+			typ = reflect.TypeOf(value)
+		}
+		return argExpr{value: value, typ: typ, null: value == nil}, nil
+	case ast.NamedPlaceholderExpr:
+		key := normalizeName(expr.Name)
+		value, ok := ctx.args.named[key]
+		if !ok {
+			return nil, fmt.Errorf("missing named query arg %q", expr.Name)
+		}
+		ctx.args.usedNamed[key] = struct{}{}
+		var typ reflect.Type
+		if value != nil {
+			typ = reflect.TypeOf(value)
+		}
+		return argExpr{value: value, typ: typ, null: value == nil}, nil
 	case ast.UnaryExpr:
 		inner, err := bindExpr(ctx, expr.Expr, schema)
 		if err != nil {
@@ -1166,9 +1273,21 @@ func bindExpr(ctx *plannerContext, expr ast.Expr, schema []relationColumn) (boun
 		if isAggregateName(expr.Name.Name) {
 			return nil, fmt.Errorf("aggregate function %q is not allowed in this context", expr.Name.Name)
 		}
-		return nil, fmt.Errorf("function calls are not supported in execution yet")
+		fn, err := lookupScalarFunction(ctx.db, expr.Name.Name, len(expr.Args))
+		if err != nil {
+			return nil, err
+		}
+		args := make([]boundExpr, 0, len(expr.Args))
+		for _, arg := range expr.Args {
+			bound, err := bindExpr(ctx, arg, schema)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, bound)
+		}
+		return scalarFunctionExpr{name: expr.Name.Name, fn: fn, args: args}, nil
 	case ast.SubqueryExpr:
-		childCtx := newPlannerContext(ctx.db, append([][]relationColumn{schema}, ctx.outer...))
+		childCtx := newPlannerContext(ctx.db, append([][]relationColumn{schema}, ctx.outer...), ctx.args)
 		plan, err := planQueryWithContext(childCtx, expr.Query)
 		if err != nil {
 			return nil, err
@@ -1205,24 +1324,48 @@ func bindQualifiedRef(ctx *plannerContext, expr ast.QualifiedRef, schema []relat
 		}
 		return nil, fmt.Errorf("unknown column %q", expr.Parts[0].Name)
 	}
-	if len(expr.Parts) != 2 {
-		return nil, fmt.Errorf("nested field references are not supported yet")
-	}
 
 	source := expr.Parts[0].Name
 	name := expr.Parts[1].Name
 	if idx, col, ok, err := resolveQualifiedLocal(schema, source, name); err != nil {
 		return nil, err
 	} else if ok {
-		return columnExpr{index: idx, col: col}, nil
+		base := boundExpr(columnExpr{index: idx, col: col})
+		return bindPathFromBase(base, expr.Parts[2:]), nil
 	}
 	if ref, ok, err := resolveQualifiedOuter(ctx, source, name); err != nil {
 		return nil, err
 	} else if ok {
 		ctx.recordOuterRef(ref)
-		return outerColumnExpr{ref: ref}, nil
+		base := boundExpr(outerColumnExpr{ref: ref})
+		return bindPathFromBase(base, expr.Parts[2:]), nil
 	}
-	return nil, fmt.Errorf("unknown column %s.%s", source, name)
+	if idx, col, ok, err := resolveIdentifierLocal(schema, expr.Parts[0].Name); err != nil {
+		return nil, err
+	} else if ok {
+		base := boundExpr(columnExpr{index: idx, col: col})
+		return bindPathFromBase(base, expr.Parts[1:]), nil
+	}
+	if ref, ok, err := resolveIdentifierOuter(ctx, expr.Parts[0].Name); err != nil {
+		return nil, err
+	} else if ok {
+		ctx.recordOuterRef(ref)
+		base := boundExpr(outerColumnExpr{ref: ref})
+		return bindPathFromBase(base, expr.Parts[1:]), nil
+	}
+	return nil, fmt.Errorf("unknown column %s", qualifiedRefName(expr.Parts))
+}
+
+func bindPathFromBase(base boundExpr, parts []ast.Identifier) boundExpr {
+	if len(parts) == 0 {
+		return base
+	}
+	path := make([]string, len(parts))
+	for i, part := range parts {
+		path[i] = part.Name
+	}
+	typ, nullable := inferPathType(base.Type(), path)
+	return pathExpr{base: base, path: path, typ: typ, nullable: base.Nullable() || nullable}
 }
 
 func resolveIdentifierLocal(schema []relationColumn, name string) (int, relationColumn, bool, error) {
@@ -1474,6 +1617,25 @@ func (e aggInExpr) Eval(ctx aggEvalContext) (any, error) {
 func (e aggInExpr) Type() reflect.Type { return reflect.TypeFor[bool]() }
 func (e aggInExpr) Nullable() bool     { return false }
 
+type aggScalarFunctionExpr struct {
+	fn   ScalarFunction
+	args []aggregateEvalExpr
+}
+
+func (e aggScalarFunctionExpr) Eval(ctx aggEvalContext) (any, error) {
+	values := make([]any, len(e.args))
+	for i, arg := range e.args {
+		value, err := arg.Eval(ctx)
+		if err != nil {
+			return nil, err
+		}
+		values[i] = value
+	}
+	return e.fn.Eval(values)
+}
+func (e aggScalarFunctionExpr) Type() reflect.Type { return e.fn.ResultType }
+func (e aggScalarFunctionExpr) Nullable() bool     { return e.fn.Nullable }
+
 type aggScalarSubqueryExpr struct {
 	expr scalarSubqueryExpr
 }
@@ -1486,6 +1648,18 @@ func (e aggScalarSubqueryExpr) Nullable() bool     { return e.expr.Nullable() }
 
 func bindAggregateExpr(ctx *plannerContext, expr ast.Expr, schema []relationColumn, groupKeys map[string]struct{}, specs map[string]aggregateSpec) (aggregateEvalExpr, error) {
 	switch expr := expr.(type) {
+	case ast.PlaceholderExpr:
+		bound, err := bindExpr(ctx, expr, schema)
+		if err != nil {
+			return nil, err
+		}
+		return aggLiteralExpr{value: ctx.args.positional[expr.Index], typ: bound.Type(), null: bound.Nullable()}, nil
+	case ast.NamedPlaceholderExpr:
+		bound, err := bindExpr(ctx, expr, schema)
+		if err != nil {
+			return nil, err
+		}
+		return aggLiteralExpr{value: ctx.args.named[normalizeName(expr.Name)], typ: bound.Type(), null: bound.Nullable()}, nil
 	case ast.NumberLiteral:
 		value, err := strconv.Atoi(expr.Raw)
 		if err != nil {
@@ -1500,7 +1674,19 @@ func bindAggregateExpr(ctx *plannerContext, expr ast.Expr, schema []relationColu
 		return aggLiteralExpr{value: nil, typ: nil, null: true}, nil
 	case ast.CallExpr:
 		if !isAggregateName(expr.Name.Name) {
-			return nil, fmt.Errorf("function calls are not supported in aggregate queries")
+			fn, err := lookupScalarFunction(ctx.db, expr.Name.Name, len(expr.Args))
+			if err != nil {
+				return nil, err
+			}
+			args := make([]aggregateEvalExpr, 0, len(expr.Args))
+			for _, arg := range expr.Args {
+				bound, err := bindAggregateExpr(ctx, arg, schema, groupKeys, specs)
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, bound)
+			}
+			return aggScalarFunctionExpr{fn: fn, args: args}, nil
 		}
 		key := exprFingerprint(expr)
 		spec, ok := specs[key]
@@ -1583,7 +1769,12 @@ func collectAggregateSpecs(ctx *plannerContext, into map[string]aggregateSpec, e
 	switch expr := expr.(type) {
 	case ast.CallExpr:
 		if !isAggregateName(expr.Name.Name) {
-			return fmt.Errorf("function calls are not supported in execution yet")
+			for _, arg := range expr.Args {
+				if err := collectAggregateSpecs(ctx, into, arg, schema); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		if len(expr.Args) != 1 {
 			return fmt.Errorf("aggregate %s requires exactly one argument", expr.Name.Name)
@@ -1646,7 +1837,15 @@ func aggregateSpecsSorted(specs map[string]aggregateSpec) []aggregateSpec {
 func containsAggregate(expr ast.Expr) bool {
 	switch expr := expr.(type) {
 	case ast.CallExpr:
-		return isAggregateName(expr.Name.Name)
+		if isAggregateName(expr.Name.Name) {
+			return true
+		}
+		for _, arg := range expr.Args {
+			if containsAggregate(arg) {
+				return true
+			}
+		}
+		return false
 	case ast.BinaryExpr:
 		return containsAggregate(expr.Left) || containsAggregate(expr.Right)
 	case ast.UnaryExpr:
@@ -1893,6 +2092,10 @@ func exprFingerprint(expr ast.Expr) string {
 		return "b:false"
 	case ast.NullLiteral:
 		return "null"
+	case ast.PlaceholderExpr:
+		return fmt.Sprintf("arg:%d", expr.Index)
+	case ast.NamedPlaceholderExpr:
+		return "named:" + strings.ToLower(expr.Name)
 	case ast.UnaryExpr:
 		return fmt.Sprintf("u:%d(%s)", expr.Op, exprFingerprint(expr.Expr))
 	case ast.BinaryExpr:
@@ -1916,6 +2119,135 @@ func exprFingerprint(expr ast.Expr) string {
 	default:
 		return fmt.Sprintf("%T", expr)
 	}
+}
+
+func lookupScalarFunction(db *DB, name string, argc int) (ScalarFunction, error) {
+	fn, ok := db.functions[normalizeName(name)]
+	if !ok {
+		return ScalarFunction{}, fmt.Errorf("unknown function %q", name)
+	}
+	if argc < fn.MinArgs {
+		return ScalarFunction{}, fmt.Errorf("function %q requires at least %d args", name, fn.MinArgs)
+	}
+	if fn.MaxArgs >= 0 && argc > fn.MaxArgs {
+		return ScalarFunction{}, fmt.Errorf("function %q accepts at most %d args", name, fn.MaxArgs)
+	}
+	return fn, nil
+}
+
+func inferPathType(baseType reflect.Type, path []string) (reflect.Type, bool) {
+	current := baseType
+	nullable := false
+	for _, part := range path {
+		for current != nil && current.Kind() == reflect.Pointer {
+			nullable = true
+			current = current.Elem()
+		}
+		if current == nil {
+			return nil, true
+		}
+		if current.Kind() == reflect.Interface {
+			return nil, true
+		}
+		switch current.Kind() {
+		case reflect.Struct:
+			field, ok := findStructField(current, part)
+			if !ok {
+				return nil, true
+			}
+			current = field.Type
+		case reflect.Map:
+			if current.Key().Kind() != reflect.String {
+				return nil, true
+			}
+			nullable = true
+			current = current.Elem()
+		default:
+			return nil, true
+		}
+	}
+	for current != nil && current.Kind() == reflect.Pointer {
+		nullable = true
+		current = current.Elem()
+	}
+	if current != nil && current.Kind() == reflect.Interface {
+		return nil, true
+	}
+	return current, nullable
+}
+
+func traverseValuePath(value any, path []string) (any, error) {
+	current := reflect.ValueOf(value)
+	for _, part := range path {
+		var ok bool
+		current, ok = derefValue(current)
+		if !ok {
+			return nil, nil
+		}
+		switch current.Kind() {
+		case reflect.Struct:
+			field, found := findStructField(current.Type(), part)
+			if !found {
+				return nil, fmt.Errorf("unknown nested field %q on %s", part, current.Type())
+			}
+			current = current.FieldByIndex(field.Index)
+		case reflect.Map:
+			if current.Type().Key().Kind() != reflect.String {
+				return nil, fmt.Errorf("nested map traversal requires string keys")
+			}
+			next := current.MapIndex(reflect.ValueOf(part))
+			if !next.IsValid() {
+				return nil, nil
+			}
+			current = next
+		default:
+			return nil, fmt.Errorf("cannot traverse %q on %s", part, current.Type())
+		}
+	}
+	current, ok := derefValue(current)
+	if !ok {
+		return nil, nil
+	}
+	return current.Interface(), nil
+}
+
+func derefValue(value reflect.Value) (reflect.Value, bool) {
+	current := value
+	for current.IsValid() && (current.Kind() == reflect.Pointer || current.Kind() == reflect.Interface) {
+		if current.IsNil() {
+			return reflect.Value{}, false
+		}
+		current = current.Elem()
+	}
+	if !current.IsValid() {
+		return reflect.Value{}, false
+	}
+	return current, true
+}
+
+func findStructField(typ reflect.Type, name string) (reflect.StructField, bool) {
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if field.PkgPath != "" {
+			continue
+		}
+		tagName, include := parseColumnTag(field)
+		if !include {
+			continue
+		}
+		if strings.EqualFold(tagName, name) {
+			return field, true
+		}
+	}
+	return reflect.StructField{}, false
+}
+
+func qualifiedRefName(parts []ast.Identifier) string {
+	names := make([]string, len(parts))
+	for i, part := range parts {
+		names[i] = part.Name
+	}
+	return strings.Join(names, ".")
 }
 
 func truthy(value any) bool {
@@ -2061,6 +2393,11 @@ func compareValues(left, right any) (int, bool) {
 		}
 		return 0, false
 	}
+}
+
+func valuesEqual(left, right any) (bool, bool) {
+	cmp, ok := compareValues(left, right)
+	return ok && cmp == 0, ok
 }
 
 func asInt64(value any) (int64, bool) {

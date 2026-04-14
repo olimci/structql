@@ -2,6 +2,7 @@ package structql
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/olimci/structql/ast"
 	"github.com/olimci/structql/parser"
@@ -22,23 +23,17 @@ func (db *DB) Register(name string, table *Table) error {
 	return nil
 }
 
-func (db *DB) Query(query string) (*Result, error) {
+func (db *DB) Query(query string, args ...any) (*Result, error) {
 	p := parser.New(query)
 	parsed, err := p.ParseQuery()
 	if err != nil {
 		return nil, err
 	}
-	return db.queryAST(parsed)
+	return db.queryAST(parsed, args)
 }
 
-func (db *DB) queryAST(q *ast.Query) (*Result, error) {
-	if db == nil {
-		return nil, fmt.Errorf("nil DB")
-	}
-	if q == nil {
-		return nil, fmt.Errorf("nil query")
-	}
-	plan, err := planQuery(db, q)
+func (db *DB) queryAST(q *ast.Query, args []any) (*Result, error) {
+	plan, err := planQuery(db, q, args)
 	if err != nil {
 		return nil, err
 	}
@@ -55,9 +50,7 @@ func (db *DB) queryAST(q *ast.Query) (*Result, error) {
 		out.Columns[i] = ResultColumn{Name: col.Name, Type: col.Type, Nullable: col.Nullable}
 	}
 	for i, row := range rel.rows {
-		values := make(Row, len(row))
-		copy(values, row)
-		out.Rows[i] = values
+		out.Rows[i] = slices.Clone(row)
 	}
 	return out, nil
 }

@@ -23,6 +23,7 @@ type Parser struct {
 	cur    token.Token
 	peek   token.Token
 	errors []ParseError
+	args   int
 }
 
 func New(input string) *Parser {
@@ -413,6 +414,16 @@ func (p *Parser) parsePrefix() ast.Expr {
 		tok := p.cur
 		p.advance()
 		return ast.NewNullLiteral(spanFromToken(tok))
+	case token.Question:
+		tok := p.cur
+		index := p.args
+		p.args++
+		p.advance()
+		return ast.NewPlaceholderExpr(spanFromToken(tok), index)
+	case token.NamedArg:
+		tok := p.cur
+		p.advance()
+		return ast.NewNamedPlaceholderExpr(spanFromToken(tok), tok.Literal[1:])
 	case token.Not, token.Minus:
 		tok := p.cur
 		p.advance()
@@ -725,10 +736,12 @@ func tokenWidth(tok token.Token) int {
 		return len(tok.Literal)
 	}
 	switch tok.Type {
-	case token.Comma, token.Dot, token.LParen, token.RParen, token.Eq, token.Lt, token.Gt, token.Plus, token.Minus, token.Star, token.Slash:
+	case token.Comma, token.Dot, token.LParen, token.RParen, token.Question, token.Eq, token.Lt, token.Gt, token.Plus, token.Minus, token.Star, token.Slash:
 		return 1
 	case token.NEq, token.LtE, token.GtE:
 		return 2
+	case token.NamedArg:
+		return len(tok.Literal)
 	default:
 		return 0
 	}
@@ -745,6 +758,10 @@ func tokenLabel(tt token.Type, literal string) string {
 		return "number"
 	case token.String:
 		return "string"
+	case token.Question:
+		return "?"
+	case token.NamedArg:
+		return "named arg"
 	case token.Select:
 		return "SELECT"
 	case token.From:

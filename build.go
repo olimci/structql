@@ -3,6 +3,7 @@ package structql
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 )
 
@@ -40,6 +41,89 @@ func BuildTable[T any](rows []T) (*Table, error) {
 	return &Table{
 		schema:  schema,
 		columns: cols,
+		rows:    len(rows),
+	}, nil
+}
+
+func BuildMapTable(rows []map[string]any) (*Table, error) {
+	type columnState struct {
+		name     string
+		typ      reflect.Type
+		nullable bool
+		values   []any
+	}
+
+	colsByKey := make(map[string]*columnState)
+	for rowIdx, row := range rows {
+		seenInRow := make(map[string]struct{}, len(row))
+		for name, value := range row {
+			key := normalizeName(name)
+			if key == "" {
+				return nil, fmt.Errorf("row %d contains an empty column name", rowIdx)
+			}
+			if _, exists := seenInRow[key]; exists {
+				return nil, fmt.Errorf("row %d contains duplicate column name %q", rowIdx, name)
+			}
+			seenInRow[key] = struct{}{}
+
+			state, ok := colsByKey[key]
+			if !ok {
+				state = &columnState{
+					name:     strings.TrimSpace(name),
+					nullable: rowIdx > 0,
+					values:   make([]any, len(rows)),
+				}
+				colsByKey[key] = state
+			}
+			state.values[rowIdx] = value
+			if value == nil {
+				state.nullable = true
+				continue
+			}
+			valueType := reflect.TypeOf(value)
+			if state.typ == nil {
+				state.typ = valueType
+				continue
+			}
+			if state.typ != valueType {
+				state.typ = nil
+			}
+		}
+		for key, state := range colsByKey {
+			if _, ok := seenInRow[key]; !ok {
+				state.nullable = true
+			}
+		}
+	}
+
+	keys := make([]string, 0, len(colsByKey))
+	for key := range colsByKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	schema := make([]Column, 0, len(keys))
+	columns := make([]tableColumn, 0, len(keys))
+	for _, key := range keys {
+		state := colsByKey[key]
+		schema = append(schema, Column{
+			Name:     state.name,
+			Type:     state.typ,
+			Nullable: state.nullable,
+		})
+		columns = append(columns, anyColumn{
+			def: Column{
+				Name:     state.name,
+				Type:     state.typ,
+				Nullable: state.nullable,
+			},
+			data: state.values,
+		})
+	}
+
+	return &Table{
+		schema:  schema,
+		columns: columns,
 		rows:    len(rows),
 	}, nil
 }

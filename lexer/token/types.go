@@ -14,6 +14,8 @@ const (
 	Dot
 	LParen
 	RParen
+	Question
+	NamedArg
 
 	Eq
 	NEq

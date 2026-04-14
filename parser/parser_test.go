@@ -118,6 +118,59 @@ func TestParseCallAndNotIn(t *testing.T) {
 	}
 }
 
+func TestParsePlaceholders(t *testing.T) {
+	t.Parallel()
+
+	input := "SELECT ?, @label, (SELECT ? FROM users WHERE id = @id) AS nested FROM users WHERE age IN (?, @max_age) LIMIT @limit"
+
+	p := New(input)
+	query, err := p.ParseQuery()
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	first, ok := query.Select[0].Expr.(ast.PlaceholderExpr)
+	if !ok || first.Index != 0 {
+		t.Fatalf("unexpected first placeholder: %#v", query.Select[0].Expr)
+	}
+	label, ok := query.Select[1].Expr.(ast.NamedPlaceholderExpr)
+	if !ok || label.Name != "label" {
+		t.Fatalf("unexpected named placeholder: %#v", query.Select[1].Expr)
+	}
+	subquery, ok := query.Select[2].Expr.(ast.SubqueryExpr)
+	if !ok {
+		t.Fatalf("expected subquery expr, got %#v", query.Select[2].Expr)
+	}
+	nestedSelect, ok := subquery.Query.Select[0].Expr.(ast.PlaceholderExpr)
+	if !ok || nestedSelect.Index != 1 {
+		t.Fatalf("unexpected nested select placeholder: %#v", subquery.Query.Select[0].Expr)
+	}
+	nestedWhere, ok := subquery.Query.Where.(ast.BinaryExpr)
+	if !ok {
+		t.Fatalf("unexpected nested where: %#v", subquery.Query.Where)
+	}
+	nestedWhereArg, ok := nestedWhere.Right.(ast.NamedPlaceholderExpr)
+	if !ok || nestedWhereArg.Name != "id" {
+		t.Fatalf("unexpected nested where placeholder: %#v", nestedWhere.Right)
+	}
+	inExpr, ok := query.Where.(ast.InExpr)
+	if !ok || len(inExpr.Right) != 2 {
+		t.Fatalf("unexpected IN expr: %#v", query.Where)
+	}
+	firstIn, ok := inExpr.Right[0].(ast.PlaceholderExpr)
+	if !ok || firstIn.Index != 2 {
+		t.Fatalf("unexpected first IN placeholder: %#v", inExpr.Right[0])
+	}
+	secondIn, ok := inExpr.Right[1].(ast.NamedPlaceholderExpr)
+	if !ok || secondIn.Name != "max_age" {
+		t.Fatalf("unexpected second IN placeholder: %#v", inExpr.Right[1])
+	}
+	limit, ok := query.Limit.(ast.NamedPlaceholderExpr)
+	if !ok || limit.Name != "limit" {
+		t.Fatalf("unexpected limit placeholder: %#v", query.Limit)
+	}
+}
+
 func TestParseQueryErrors(t *testing.T) {
 	t.Parallel()
 

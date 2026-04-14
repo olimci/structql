@@ -25,6 +25,8 @@ func TestExpressionNodesImplementExpr(t *testing.T) {
 		StringLiteral{},
 		BoolLiteral{},
 		NullLiteral{},
+		PlaceholderExpr{},
+		NamedPlaceholderExpr{},
 		UnaryExpr{},
 		BinaryExpr{},
 		InExpr{},

@@ -91,6 +91,36 @@ func NewNullLiteral(span Span) NullLiteral {
 	return NullLiteral{span: span}
 }
 
+type PlaceholderExpr struct {
+	span  Span
+	Index int
+}
+
+func (p PlaceholderExpr) Span() Span {
+	return p.span
+}
+
+func (PlaceholderExpr) exprNode() {}
+
+func NewPlaceholderExpr(span Span, index int) PlaceholderExpr {
+	return PlaceholderExpr{span: span, Index: index}
+}
+
+type NamedPlaceholderExpr struct {
+	span Span
+	Name string
+}
+
+func (p NamedPlaceholderExpr) Span() Span {
+	return p.span
+}
+
+func (NamedPlaceholderExpr) exprNode() {}
+
+func NewNamedPlaceholderExpr(span Span, name string) NamedPlaceholderExpr {
+	return NamedPlaceholderExpr{span: span, Name: name}
+}
+
 type UnaryExpr struct {
 	span Span
 	Op   token.Type
