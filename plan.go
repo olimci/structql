@@ -606,6 +606,21 @@ func planNonAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query
 	items := make([]projectItem, 0, len(query.Select))
 	schema := make([]relationColumn, 0, len(query.Select))
 	for i, item := range query.Select {
+		if item.Wildcard != nil {
+			for idx, col := range input.schema() {
+				items = append(items, projectItem{
+					name: col.Name,
+					expr: columnExpr{index: idx, col: col},
+				})
+				schema = append(schema, relationColumn{
+					Source:   col.Source,
+					Name:     col.Name,
+					Type:     col.Type,
+					Nullable: col.Nullable,
+				})
+			}
+			continue
+		}
 		expr, err := bindExpr(ctx, item.Expr, input.schema())
 		if err != nil {
 			return nil, err
@@ -618,6 +633,11 @@ func planNonAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query
 }
 
 func planAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query) (planNode, error) {
+	for _, item := range query.Select {
+		if item.Wildcard != nil {
+			return nil, fmt.Errorf("SELECT * is not allowed in aggregate queries")
+		}
+	}
 	groupExprs := make([]boundExpr, 0, len(query.GroupBy))
 	groupKeys := make(map[string]struct{}, len(query.GroupBy))
 	for _, expr := range query.GroupBy {
@@ -740,7 +760,7 @@ func planTableRef(ctx *plannerContext, ref ast.TableRef) (planNode, error) {
 func selectAliases(items []ast.SelectItem) map[string]ast.Expr {
 	out := make(map[string]ast.Expr, len(items))
 	for _, item := range items {
-		if item.Alias != nil {
+		if item.Alias != nil && item.Expr != nil {
 			out[normalizeName(item.Alias.Name)] = item.Expr
 		}
 	}

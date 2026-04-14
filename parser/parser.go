@@ -150,6 +150,13 @@ func (p *Parser) parseSelectList() []ast.SelectItem {
 }
 
 func (p *Parser) parseSelectItem() *ast.SelectItem {
+	if wildcard := p.parseSelectWildcard(); wildcard != nil {
+		if p.cur.Type == token.As || p.cur.Type == token.Identifier {
+			p.errorAtCurrent("wildcard SELECT items cannot have aliases", nil)
+		}
+		return wildcard
+	}
+
 	expr := p.parseExpression(precLowest)
 	if expr == nil {
 		p.errorAtCurrent("expected expression in SELECT list", nil)
@@ -178,6 +185,16 @@ func (p *Parser) parseSelectItem() *ast.SelectItem {
 	}
 
 	return &item
+}
+
+func (p *Parser) parseSelectWildcard() *ast.SelectItem {
+	if p.cur.Type == token.Star {
+		tok := p.cur
+		p.advance()
+		item := ast.NewSelectWildcardItem(spanFromToken(tok), nil)
+		return &item
+	}
+	return nil
 }
 
 func (p *Parser) parseFromList() []ast.TableRef {

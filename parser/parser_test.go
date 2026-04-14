@@ -171,6 +171,22 @@ func TestParsePlaceholders(t *testing.T) {
 	}
 }
 
+func TestParseSelectWildcard(t *testing.T) {
+	t.Parallel()
+
+	p := New("SELECT * FROM users")
+	query, err := p.ParseQuery()
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+	if len(query.Select) != 1 {
+		t.Fatalf("unexpected select count: %d", len(query.Select))
+	}
+	if query.Select[0].Wildcard == nil {
+		t.Fatalf("expected wildcard select item: %#v", query.Select[0])
+	}
+}
+
 func TestParseQueryErrors(t *testing.T) {
 	t.Parallel()
 

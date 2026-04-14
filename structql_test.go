@@ -124,6 +124,44 @@ func TestQueryExecutionJoinFilterOrderLimit(t *testing.T) {
 	}
 }
 
+func TestSelectWildcard(t *testing.T) {
+	t.Parallel()
+
+	city1 := 1
+	city2 := 2
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, CityID: &city1, Visible: "Ada"},
+		{ID: 2, Name: "Bob", Age: 25, Active: false, CityID: &city2, Visible: "Bob"},
+		{ID: 3, Name: "Cara", Age: 40, Active: true, CityID: nil, Visible: "Cara"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable users failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	result, err := db.Query("select * from users where active = true order by id asc limit 2")
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+
+	if len(result.Columns) != 6 {
+		t.Fatalf("unexpected column count: %#v", result.Columns)
+	}
+	if result.Columns[0].Name != "id" || result.Columns[1].Name != "name" || result.Columns[5].Name != "visible_name" {
+		t.Fatalf("unexpected column names: %#v", result.Columns)
+	}
+	if len(result.Rows) != 2 {
+		t.Fatalf("unexpected row count: %#v", result.Rows)
+	}
+	if result.Rows[0][0] != 1 || result.Rows[1][0] != 3 {
+		t.Fatalf("unexpected wildcard rows: %#v", result.Rows)
+	}
+}
+
 func TestQueryArgsAcrossExpressionsAndLimit(t *testing.T) {
 	t.Parallel()
 
@@ -529,6 +567,24 @@ func TestQueryGlobalAggregate(t *testing.T) {
 	}
 	if len(result.Rows) != 1 || result.Rows[0][0] != int64(2) || result.Rows[0][1] != 30 {
 		t.Fatalf("unexpected global aggregate result: %#v", result.Rows)
+	}
+}
+
+func TestSelectWildcardRejectedInAggregateQuery(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{{ID: 1, Name: "Ada", Age: 30, Active: true, Visible: "Ada"}})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	if _, err := db.Query("select *, count(age) from users group by id"); err == nil {
+		t.Fatalf("expected aggregate wildcard error")
 	}
 }
 

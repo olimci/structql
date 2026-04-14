@@ -26,9 +26,10 @@ func (q *Query) SetSpan(span Span) {
 }
 
 type SelectItem struct {
-	span  Span
-	Expr  Expr
-	Alias *Identifier
+	span     Span
+	Expr     Expr
+	Alias    *Identifier
+	Wildcard *QualifiedRef
 }
 
 func (s SelectItem) Span() Span {
@@ -37,6 +38,14 @@ func (s SelectItem) Span() Span {
 
 func NewSelectItem(span Span, expr Expr, alias *Identifier) SelectItem {
 	return SelectItem{span: span, Expr: expr, Alias: alias}
+}
+
+func NewSelectWildcardItem(span Span, wildcard *QualifiedRef) SelectItem {
+	if wildcard == nil {
+		empty := NewQualifiedRef(span, nil)
+		wildcard = &empty
+	}
+	return SelectItem{span: span, Wildcard: wildcard}
 }
 
 func (s *SelectItem) SetSpan(span Span) {
