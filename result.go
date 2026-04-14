@@ -12,6 +12,26 @@ type resultField struct {
 	typ   reflect.Type
 }
 
+func (r *Result) Maps() []map[string]any {
+	if r == nil {
+		return nil
+	}
+
+	rows := make([]map[string]any, 0, len(r.Rows))
+	for _, row := range r.Rows {
+		item := make(map[string]any, len(r.Columns))
+		for i, col := range r.Columns {
+			if i >= len(row) {
+				item[col.Name] = nil
+				continue
+			}
+			item[col.Name] = row[i]
+		}
+		rows = append(rows, item)
+	}
+	return rows
+}
+
 func (r *Result) Scan(dest any) error {
 	if r == nil {
 		return fmt.Errorf("nil result")

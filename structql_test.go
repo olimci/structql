@@ -162,6 +162,43 @@ func TestSelectWildcard(t *testing.T) {
 	}
 }
 
+func TestResultMaps(t *testing.T) {
+	t.Parallel()
+
+	city1 := 1
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, CityID: &city1, Visible: "Ada"},
+		{ID: 2, Name: "Bob", Age: 25, Active: false, CityID: nil, Visible: "Bob"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable users failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	result, err := db.Query("select id, name, city_id from users order by id asc")
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+
+	rows := result.Maps()
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if got := rows[0]["id"]; got != 1 {
+		t.Fatalf("expected first row id 1, got %#v", got)
+	}
+	if got := rows[0]["name"]; got != "Ada" {
+		t.Fatalf("expected first row name Ada, got %#v", got)
+	}
+	if got := rows[1]["city_id"]; got != nil {
+		t.Fatalf("expected second row city_id nil, got %#v", got)
+	}
+}
+
 func TestQueryArgsAcrossExpressionsAndLimit(t *testing.T) {
 	t.Parallel()
 
