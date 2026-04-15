@@ -3,6 +3,7 @@ package structql
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 type testUser struct {
@@ -39,6 +40,11 @@ type nestedUser struct {
 	Meta  map[string]any `structql:"meta"`
 	Tags  []string       `structql:"tags"`
 	Alias *nestedAlias   `structql:"alias"`
+}
+
+type timedRow struct {
+	ID        int       `structql:"id"`
+	CreatedAt time.Time `structql:"created_at"`
 }
 
 func TestBuildTableSchemaAndTags(t *testing.T) {
@@ -121,6 +127,40 @@ func TestQueryExecutionJoinFilterOrderLimit(t *testing.T) {
 	}
 	if got := result.Rows[1][0]; got != "Ada" || result.Rows[1][1] != "Edmonton" {
 		t.Fatalf("unexpected second row: %#v", result.Rows[1])
+	}
+}
+
+func TestOrderByTime(t *testing.T) {
+	t.Parallel()
+
+	rows, err := BuildTable([]timedRow{
+		{ID: 1, CreatedAt: time.Date(2026, 1, 14, 17, 3, 27, 0, time.UTC)},
+		{ID: 2, CreatedAt: time.Date(2026, 4, 14, 18, 48, 24, 0, time.UTC)},
+		{ID: 3, CreatedAt: time.Date(2026, 3, 12, 22, 6, 49, 0, time.UTC)},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("events", rows); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	desc, err := db.Query("select id from events order by created_at desc")
+	if err != nil {
+		t.Fatalf("desc query failed: %v", err)
+	}
+	if got := []any{desc.Rows[0][0], desc.Rows[1][0], desc.Rows[2][0]}; !reflect.DeepEqual(got, []any{2, 3, 1}) {
+		t.Fatalf("unexpected desc order: %#v", got)
+	}
+
+	asc, err := db.Query("select id from events order by created_at asc")
+	if err != nil {
+		t.Fatalf("asc query failed: %v", err)
+	}
+	if got := []any{asc.Rows[0][0], asc.Rows[1][0], asc.Rows[2][0]}; !reflect.DeepEqual(got, []any{1, 3, 2}) {
+		t.Fatalf("unexpected asc order: %#v", got)
 	}
 }
 

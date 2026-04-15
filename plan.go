@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/olimci/structql/ast"
 	"github.com/olimci/structql/lexer/token"
@@ -2351,6 +2352,20 @@ func isFloatType(t reflect.Type) bool {
 func compareValues(left, right any) (int, bool) {
 	if left == nil || right == nil {
 		return 0, false
+	}
+	if lt, lok := left.(time.Time); lok {
+		rt, rok := right.(time.Time)
+		if !rok {
+			return 0, false
+		}
+		switch {
+		case lt.Before(rt):
+			return -1, true
+		case lt.After(rt):
+			return 1, true
+		default:
+			return 0, true
+		}
 	}
 	if lf, lok := asFloat64(left); lok {
 		if rf, rok := asFloat64(right); rok {
