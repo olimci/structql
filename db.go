@@ -5,7 +5,6 @@ import (
 	"slices"
 
 	"github.com/olimci/structql/ast"
-	"github.com/olimci/structql/parser"
 )
 
 func (db *DB) Register(name string, table *Table) error {
@@ -24,16 +23,23 @@ func (db *DB) Register(name string, table *Table) error {
 }
 
 func (db *DB) Query(query string, args ...any) (*Result, error) {
-	p := parser.New(query)
-	parsed, err := p.ParseQuery()
+	prepared, err := db.Prepare(query)
 	if err != nil {
 		return nil, err
 	}
-	return db.queryAST(parsed, args)
+	return prepared.Query(db, args...)
 }
 
 func (db *DB) queryAST(q *ast.Query, args []any) (*Result, error) {
-	plan, err := planQuery(db, q, args)
+	parsedArgs, err := parseQueryArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	return db.queryPrepared(&PreparedQuery{ast: q}, parsedArgs)
+}
+
+func (db *DB) queryPrepared(prepared *PreparedQuery, parsedArgs *queryArgs) (*Result, error) {
+	plan, err := planQueryWithParsedArgs(db, prepared.ast, parsedArgs)
 	if err != nil {
 		return nil, err
 	}

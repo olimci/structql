@@ -1,7 +1,9 @@
 package structql
 
 import (
+	"container/heap"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -34,6 +36,11 @@ type planNode interface {
 	execute(outer []Row) (*relation, error)
 }
 
+type tableRefPlan struct {
+	node    planNode
+	lateral bool
+}
+
 type scanNode struct {
 	table *Table
 	sch   []relationColumn
@@ -42,15 +49,7 @@ type scanNode struct {
 func (n *scanNode) schema() []relationColumn { return n.sch }
 
 func (n *scanNode) execute(_ []Row) (*relation, error) {
-	rows := make([]Row, n.table.rows)
-	for i := 0; i < n.table.rows; i++ {
-		row := make(Row, len(n.table.columns))
-		for j, col := range n.table.columns {
-			row[j] = col.ValueAt(i)
-		}
-		rows[i] = row
-	}
-	return &relation{schema: cloneSchema(n.sch), rows: rows}, nil
+	return &relation{schema: cloneSchema(n.sch), rows: n.table.materializedRows()}, nil
 }
 
 type renameSourceNode struct {
@@ -69,9 +68,10 @@ func (n *renameSourceNode) execute(outer []Row) (*relation, error) {
 }
 
 type cartesianNode struct {
-	left  planNode
-	right planNode
-	sch   []relationColumn
+	left         planNode
+	right        planNode
+	rightLateral bool
+	sch          []relationColumn
 }
 
 func (n *cartesianNode) schema() []relationColumn { return n.sch }
@@ -81,26 +81,44 @@ func (n *cartesianNode) execute(outer []Row) (*relation, error) {
 	if err != nil {
 		return nil, err
 	}
-	right, err := n.right.execute(outer)
-	if err != nil {
-		return nil, err
-	}
 
-	rows := make([]Row, 0, len(left.rows)*len(right.rows))
+	rows := make([]Row, 0)
 	for _, lrow := range left.rows {
+		rightOuter := outer
+		if n.rightLateral {
+			rightOuter = prependOuter(lrow, outer)
+		}
+		right, err := n.right.execute(rightOuter)
+		if err != nil {
+			return nil, err
+		}
 		for _, rrow := range right.rows {
 			rows = append(rows, joinRows(lrow, rrow))
+		}
+	}
+	if !n.rightLateral {
+		right, err := n.right.execute(outer)
+		if err != nil {
+			return nil, err
+		}
+		rows = rows[:0]
+		rows = make([]Row, 0, len(left.rows)*len(right.rows))
+		for _, lrow := range left.rows {
+			for _, rrow := range right.rows {
+				rows = append(rows, joinRows(lrow, rrow))
+			}
 		}
 	}
 	return &relation{schema: cloneSchema(n.sch), rows: rows}, nil
 }
 
 type joinNode struct {
-	kind  ast.JoinKind
-	left  planNode
-	right planNode
-	on    boundExpr
-	sch   []relationColumn
+	kind         ast.JoinKind
+	left         planNode
+	right        planNode
+	rightLateral bool
+	on           boundExpr
+	sch          []relationColumn
 }
 
 func (n *joinNode) schema() []relationColumn { return n.sch }
@@ -110,17 +128,22 @@ func (n *joinNode) execute(outer []Row) (*relation, error) {
 	if err != nil {
 		return nil, err
 	}
-	right, err := n.right.execute(outer)
-	if err != nil {
-		return nil, err
+	if n.kind == ast.RightJoin && n.rightLateral {
+		return nil, fmt.Errorf("RIGHT JOIN does not support lateral table functions")
 	}
-
-	switch n.kind {
-	case ast.RightJoin:
-		return n.executeRight(left, right, outer)
-	default:
-		return n.executeLeft(left, right, outer)
+	if !n.rightLateral {
+		right, err := n.right.execute(outer)
+		if err != nil {
+			return nil, err
+		}
+		switch n.kind {
+		case ast.RightJoin:
+			return n.executeRight(left, right, outer)
+		default:
+			return n.executeLeft(left, right, outer)
+		}
 	}
+	return n.executeLeftLateral(left, outer)
 }
 
 func (n *joinNode) executeLeft(left, right *relation, outer []Row) (*relation, error) {
@@ -164,6 +187,33 @@ func (n *joinNode) executeRight(left, right *relation, outer []Row) (*relation, 
 		}
 		if !matched {
 			rows = append(rows, joinRows(leftNulls, rrow))
+		}
+	}
+	return &relation{schema: cloneSchema(n.sch), rows: rows}, nil
+}
+
+func (n *joinNode) executeLeftLateral(left *relation, outer []Row) (*relation, error) {
+	rows := make([]Row, 0)
+	for _, lrow := range left.rows {
+		right, err := n.right.execute(prependOuter(lrow, outer))
+		if err != nil {
+			return nil, err
+		}
+		rightNulls := make(Row, len(right.schema))
+		matched := false
+		for _, rrow := range right.rows {
+			joined := joinRows(lrow, rrow)
+			ok, err := n.evalJoin(joined, outer)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				matched = true
+				rows = append(rows, joined)
+			}
+		}
+		if !matched && n.kind == ast.LeftJoin {
+			rows = append(rows, joinRows(lrow, rightNulls))
 		}
 	}
 	return &relation{schema: cloneSchema(n.sch), rows: rows}, nil
@@ -213,6 +263,7 @@ type orderTermPlan struct {
 type sortNode struct {
 	input planNode
 	terms []orderTermPlan
+	limit int
 }
 
 func (n *sortNode) schema() []relationColumn { return n.input.schema() }
@@ -242,25 +293,19 @@ func (n *sortNode) execute(outer []Row) (*relation, error) {
 	for i := range indices {
 		indices[i] = i
 	}
-	sort.SliceStable(indices, func(i, j int) bool {
-		li, ri := indices[i], indices[j]
-		for termIdx, term := range n.terms {
-			cmp, ok := compareValues(keys[termIdx][li], keys[termIdx][ri])
-			if !ok || cmp == 0 {
-				continue
-			}
-			if term.desc {
-				return cmp > 0
-			}
-			return cmp < 0
-		}
-		return false
-	})
+	if n.limit > 0 && n.limit < len(indices) {
+		indices = topNIndices(indices, n.limit, keys, n.terms)
+	} else {
+		sort.SliceStable(indices, func(i, j int) bool {
+			return compareOrderKeys(keys, n.terms, indices[i], indices[j]) < 0
+		})
+	}
 
 	rows := make([]Row, len(rel.rows))
 	for i, idx := range indices {
 		rows[i] = rel.rows[idx]
 	}
+	rows = rows[:len(indices)]
 	return &relation{schema: cloneSchema(rel.schema), rows: rows}, nil
 }
 
@@ -280,6 +325,43 @@ func (n *limitNode) execute(outer []Row) (*relation, error) {
 		rel.rows = rel.rows[:n.limit]
 	}
 	return rel, nil
+}
+
+type distinctNode struct {
+	input planNode
+}
+
+func (n *distinctNode) schema() []relationColumn { return n.input.schema() }
+
+func (n *distinctNode) execute(outer []Row) (*relation, error) {
+	rel, err := n.input.execute(outer)
+	if err != nil {
+		return nil, err
+	}
+
+	rows := make([]Row, 0, len(rel.rows))
+	seen := make(map[string]struct{}, len(rel.rows))
+	for _, row := range rel.rows {
+		if key, ok := rowHashKey(row); ok {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			rows = append(rows, row)
+			continue
+		}
+		duplicate := false
+		for _, existing := range rows {
+			if rowsEqual(existing, row) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			rows = append(rows, row)
+		}
+	}
+	return &relation{schema: cloneSchema(rel.schema), rows: rows}, nil
 }
 
 type projectItem struct {
@@ -319,6 +401,8 @@ type aggregateSpec struct {
 	key      string
 	name     string
 	arg      boundExpr
+	star     bool
+	distinct bool
 	typ      reflect.Type
 	nullable bool
 }
@@ -348,9 +432,9 @@ type aggregateNode struct {
 	input      planNode
 	groupExprs []boundExpr
 	aggSpecs   []aggregateSpec
+	having     aggregateEvalExpr
 	selects    []aggProjectItem
 	orderBy    []aggOrderTerm
-	limit      *int
 	sch        []relationColumn
 }
 
@@ -419,6 +503,15 @@ func (n *aggregateNode) execute(outer []Row) (*relation, error) {
 		for i, spec := range n.aggSpecs {
 			ctx.values[spec.key] = group.aggs[i].Result()
 		}
+		if n.having != nil {
+			value, err := n.having.Eval(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if !truthy(value) {
+				continue
+			}
+		}
 
 		row := make(Row, len(n.selects))
 		for i, item := range n.selects {
@@ -458,9 +551,6 @@ func (n *aggregateNode) execute(outer []Row) (*relation, error) {
 	rows := make([]Row, len(projected))
 	for i, item := range projected {
 		rows[i] = item.row
-	}
-	if n.limit != nil && *n.limit < len(rows) {
-		rows = rows[:*n.limit]
 	}
 	return &relation{schema: cloneSchema(n.sch), rows: rows}, nil
 }
@@ -502,16 +592,17 @@ func planQuery(db *DB, query *ast.Query, args []any) (planNode, error) {
 	if err != nil {
 		return nil, err
 	}
+	return planQueryWithParsedArgs(db, query, parsedArgs)
+}
+
+func planQueryWithParsedArgs(db *DB, query *ast.Query, parsedArgs *queryArgs) (planNode, error) {
 	ctx := newPlannerContext(db, nil, parsedArgs)
 	plan, err := planQueryWithContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	if len(parsedArgs.usedPos) != len(parsedArgs.positional) {
-		return nil, fmt.Errorf("expected %d positional query args but used %d placeholders", len(parsedArgs.positional), len(parsedArgs.usedPos))
-	}
-	if len(parsedArgs.usedNamed) != len(parsedArgs.named) {
-		return nil, fmt.Errorf("expected %d named query args but used %d placeholders", len(parsedArgs.named), len(parsedArgs.usedNamed))
+	if err := parsedArgs.validateUsage(); err != nil {
+		return nil, err
 	}
 	return plan, nil
 }
@@ -533,10 +624,22 @@ func planQueryWithContext(ctx *plannerContext, query *ast.Query) (planNode, erro
 		input = &filterNode{input: input, pred: pred}
 	}
 
-	if len(query.GroupBy) > 0 || selectsContainAggregate(query.Select) || orderTermsContainAggregate(query.OrderBy) {
-		return planAggregateQuery(ctx, input, query)
+	aggregateQuery := len(query.GroupBy) > 0 || query.Having != nil || selectsContainAggregate(query.Select) || orderTermsContainAggregate(query.OrderBy)
+	if aggregateQuery {
+		core, err := planAggregateQuery(ctx, input, query)
+		if err != nil {
+			return nil, err
+		}
+		return finalizeQueryPlan(ctx, core, query, input.schema())
 	}
-	return planNonAggregateQuery(ctx, input, query)
+	if query.Having != nil {
+		return nil, fmt.Errorf("HAVING requires GROUP BY or aggregate expressions")
+	}
+	core, err := planNonAggregateQuery(ctx, input, query)
+	if err != nil {
+		return nil, err
+	}
+	return finalizeQueryPlan(ctx, core, query, input.schema())
 }
 
 func planSourceQuery(ctx *plannerContext, query *ast.Query) (planNode, error) {
@@ -544,42 +647,83 @@ func planSourceQuery(ctx *plannerContext, query *ast.Query) (planNode, error) {
 		return nil, fmt.Errorf("query must include FROM")
 	}
 
-	plan, err := planTableRef(ctx, query.From[0])
+	first, err := planTableRef(ctx, query.From[0], nil)
 	if err != nil {
 		return nil, err
 	}
+	if first.lateral {
+		return nil, fmt.Errorf("FROM table functions cannot reference earlier sources")
+	}
+	plan := first.node
 	for _, ref := range query.From[1:] {
-		right, err := planTableRef(ctx, ref)
+		right, err := planTableRef(ctx, ref, nil)
 		if err != nil {
 			return nil, err
 		}
+		if right.lateral {
+			return nil, fmt.Errorf("comma-separated FROM sources do not support lateral table functions")
+		}
 		plan = &cartesianNode{
 			left:  plan,
-			right: right,
-			sch:   append(cloneSchema(plan.schema()), cloneSchema(right.schema())...),
+			right: right.node,
+			sch:   append(cloneSchema(plan.schema()), cloneSchema(right.node.schema())...),
 		}
 	}
 	for _, join := range query.Joins {
-		right, err := planTableRef(ctx, join.Table)
+		if join.Kind == ast.RightJoin && join.Table.Function != nil {
+			return nil, fmt.Errorf("RIGHT JOIN does not support table functions")
+		}
+		right, err := planTableRef(ctx, join.Table, plan.schema())
 		if err != nil {
 			return nil, err
 		}
 		var on boundExpr
 		if join.On != nil {
-			on, err = bindExpr(ctx, join.On, append(cloneSchema(plan.schema()), cloneSchema(right.schema())...))
+			on, err = bindExpr(ctx, join.On, append(cloneSchema(plan.schema()), cloneSchema(right.node.schema())...))
 			if err != nil {
 				return nil, err
 			}
 		}
 		plan = &joinNode{
-			kind:  join.Kind,
-			left:  plan,
-			right: right,
-			on:    on,
-			sch:   joinSchema(plan.schema(), right.schema(), join.Kind),
+			kind:         join.Kind,
+			left:         plan,
+			right:        right.node,
+			rightLateral: right.lateral,
+			on:           on,
+			sch:          joinSchema(plan.schema(), right.node.schema(), join.Kind),
 		}
 	}
 	return plan, nil
+}
+
+func finalizeQueryPlan(ctx *plannerContext, input planNode, query *ast.Query, sourceSchema []relationColumn) (planNode, error) {
+	var err error
+	if query.Distinct {
+		input = &distinctNode{input: input}
+	}
+	if query.Limit != nil {
+		var limit int
+		limit, err = parseLimit(ctx, query.Limit, sourceSchema)
+		if err != nil {
+			return nil, err
+		}
+		if !query.Distinct {
+			applyTopNLimit(input, limit)
+		}
+		input = &limitNode{input: input, limit: limit}
+	}
+	return input, nil
+}
+
+func applyTopNLimit(node planNode, limit int) {
+	switch n := node.(type) {
+	case *sortNode:
+		n.limit = limit
+	case *projectNode:
+		if sort, ok := n.input.(*sortNode); ok {
+			sort.limit = limit
+		}
+	}
 }
 
 func planNonAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query) (planNode, error) {
@@ -594,14 +738,6 @@ func planNonAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query
 			terms = append(terms, orderTermPlan{expr: expr, desc: term.Desc})
 		}
 		input = &sortNode{input: input, terms: terms}
-	}
-
-	if query.Limit != nil {
-		limit, err := parseLimit(ctx, query.Limit, input.schema())
-		if err != nil {
-			return nil, err
-		}
-		input = &limitNode{input: input, limit: limit}
 	}
 
 	items := make([]projectItem, 0, len(query.Select))
@@ -671,6 +807,11 @@ func planAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query) (
 			return nil, err
 		}
 	}
+	if query.Having != nil {
+		if err := collectAggregateSpecs(ctx, specsByKey, query.Having, input.schema()); err != nil {
+			return nil, err
+		}
+	}
 	specs := aggregateSpecsSorted(specsByKey)
 
 	selects := make([]aggProjectItem, 0, len(query.Select))
@@ -700,52 +841,55 @@ func planAggregateQuery(ctx *plannerContext, input planNode, query *ast.Query) (
 		orderTerms = append(orderTerms, aggOrderTerm{expr: expr, desc: term.Desc})
 	}
 
-	var limit *int
-	if query.Limit != nil {
-		parsed, err := parseLimit(ctx, query.Limit, input.schema())
+	var having aggregateEvalExpr
+	if query.Having != nil {
+		var err error
+		having, err = bindAggregateExpr(ctx, query.Having, input.schema(), groupKeys, specsByKey)
 		if err != nil {
 			return nil, err
 		}
-		limit = &parsed
 	}
 
 	return &aggregateNode{
 		input:      input,
 		groupExprs: groupExprs,
 		aggSpecs:   specs,
+		having:     having,
 		selects:    selects,
 		orderBy:    orderTerms,
-		limit:      limit,
 		sch:        schema,
 	}, nil
 }
 
-func planTableRef(ctx *plannerContext, ref ast.TableRef) (planNode, error) {
+func planTableRef(ctx *plannerContext, ref ast.TableRef, lateralOuter []relationColumn) (tableRefPlan, error) {
 	if ref.Subquery != nil {
 		childCtx := newPlannerContext(ctx.db, nil, ctx.args)
 		child, err := planQueryWithContext(childCtx, ref.Subquery)
 		if err != nil {
-			return nil, err
+			return tableRefPlan{}, err
 		}
 		if len(childCtx.captureSeq) > 0 {
-			return nil, fmt.Errorf("correlated derived tables are not supported yet")
+			return tableRefPlan{}, fmt.Errorf("correlated derived tables are not supported yet")
 		}
 		if ref.Alias == nil {
-			return nil, fmt.Errorf("derived tables require an alias")
+			return tableRefPlan{}, fmt.Errorf("derived tables require an alias")
 		}
 		schema := cloneSchema(child.schema())
 		for i := range schema {
 			schema[i].Source = ref.Alias.Name
 		}
-		return &renameSourceNode{input: child, sch: schema}, nil
+		return tableRefPlan{node: &renameSourceNode{input: child, sch: schema}}, nil
+	}
+	if ref.Function != nil {
+		return planFunctionTableRef(ctx, ref, lateralOuter)
 	}
 	if ref.Name == nil || len(ref.Name.Parts) != 1 {
-		return nil, fmt.Errorf("table references currently support a single identifier")
+		return tableRefPlan{}, fmt.Errorf("table references currently support a single identifier")
 	}
 	tableName := ref.Name.Parts[0].Name
 	table, ok := ctx.db.tables[normalizeName(tableName)]
 	if !ok {
-		return nil, fmt.Errorf("unknown table %q", tableName)
+		return tableRefPlan{}, fmt.Errorf("unknown table %q", tableName)
 	}
 	source := tableName
 	if ref.Alias != nil {
@@ -755,7 +899,72 @@ func planTableRef(ctx *plannerContext, ref ast.TableRef) (planNode, error) {
 	for i, col := range table.schema {
 		schema[i] = relationColumn{Source: source, Name: col.Name, Type: col.Type, Nullable: col.Nullable}
 	}
-	return &scanNode{table: table, sch: schema}, nil
+	return tableRefPlan{node: &scanNode{table: table, sch: schema}}, nil
+}
+
+func planFunctionTableRef(ctx *plannerContext, ref ast.TableRef, lateralOuter []relationColumn) (tableRefPlan, error) {
+	if ref.Function == nil {
+		return tableRefPlan{}, fmt.Errorf("table function missing")
+	}
+	if ref.Alias == nil {
+		return tableRefPlan{}, fmt.Errorf("table functions require an alias")
+	}
+
+	call := ref.Function
+	if normalizeName(call.Name.Name) != "unnest" {
+		return tableRefPlan{}, fmt.Errorf("unknown table function %q", call.Name.Name)
+	}
+	if len(call.Args) != 1 {
+		return tableRefPlan{}, fmt.Errorf("unnest requires exactly one argument")
+	}
+
+	bindCtx := ctx
+	if len(lateralOuter) > 0 {
+		bindCtx = newPlannerContext(ctx.db, append([][]relationColumn{lateralOuter}, ctx.outer...), ctx.args)
+	}
+
+	arg, err := bindExpr(bindCtx, call.Args[0], nil)
+	if err != nil {
+		return tableRefPlan{}, err
+	}
+
+	colType, colNullable, err := unnestColumnType(arg.Type(), arg.Nullable())
+	if err != nil {
+		return tableRefPlan{}, err
+	}
+	node := &unnestNode{
+		expr: arg,
+		sch: []relationColumn{{
+			Source:   ref.Alias.Name,
+			Name:     "value",
+			Type:     colType,
+			Nullable: colNullable,
+		}},
+	}
+	return tableRefPlan{
+		node:    node,
+		lateral: len(bindCtx.captureSeq) > 0,
+	}, nil
+}
+
+func unnestColumnType(typ reflect.Type, nullable bool) (reflect.Type, bool, error) {
+	if typ == nil {
+		return nil, true, nil
+	}
+	for typ.Kind() == reflect.Pointer {
+		nullable = true
+		typ = typ.Elem()
+	}
+	if typ.Kind() != reflect.Slice && typ.Kind() != reflect.Array {
+		return nil, false, fmt.Errorf("unnest requires a slice or array argument")
+	}
+	elem := typ.Elem()
+	elemNullable := nullable
+	for elem.Kind() == reflect.Pointer {
+		elemNullable = true
+		elem = elem.Elem()
+	}
+	return elem, elemNullable, nil
 }
 
 func selectAliases(items []ast.SelectItem) map[string]ast.Expr {
@@ -860,6 +1069,62 @@ func joinRows(left, right Row) Row {
 	return row
 }
 
+func rowsEqual(left, right Row) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if !reflect.DeepEqual(left[i], right[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func prependOuter(row Row, outer []Row) []Row {
+	child := make([]Row, 0, len(outer)+1)
+	child = append(child, row)
+	child = append(child, outer...)
+	return child
+}
+
+type unnestNode struct {
+	expr boundExpr
+	sch  []relationColumn
+}
+
+func (n *unnestNode) schema() []relationColumn { return n.sch }
+
+func (n *unnestNode) execute(outer []Row) (*relation, error) {
+	value, err := n.expr.Eval(evalContext{outer: outer})
+	if err != nil {
+		return nil, err
+	}
+	if value == nil {
+		return &relation{schema: cloneSchema(n.sch)}, nil
+	}
+
+	v := reflect.ValueOf(value)
+	for v.IsValid() && (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) {
+		if v.IsNil() {
+			return &relation{schema: cloneSchema(n.sch)}, nil
+		}
+		v = v.Elem()
+	}
+	if !v.IsValid() {
+		return &relation{schema: cloneSchema(n.sch)}, nil
+	}
+	if v.Kind() != reflect.Slice && v.Kind() != reflect.Array {
+		return nil, fmt.Errorf("unnest requires a slice or array, got %T", value)
+	}
+
+	rows := make([]Row, 0, v.Len())
+	for i := range v.Len() {
+		rows = append(rows, Row{v.Index(i).Interface()})
+	}
+	return &relation{schema: cloneSchema(n.sch), rows: rows}, nil
+}
+
 type boundExpr interface {
 	Eval(evalContext) (any, error)
 	Type() reflect.Type
@@ -946,24 +1211,7 @@ func (e unaryBoundExpr) Eval(ctx evalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch e.op {
-	case token.Not:
-		if value == nil {
-			return nil, nil
-		}
-		b, ok := value.(bool)
-		if !ok {
-			return nil, fmt.Errorf("NOT requires a boolean operand")
-		}
-		return !b, nil
-	case token.Minus:
-		if value == nil {
-			return nil, nil
-		}
-		return negateNumber(value)
-	default:
-		return nil, fmt.Errorf("unsupported unary operator")
-	}
+	return evalUnaryOp(e.op, value)
 }
 func (e unaryBoundExpr) Type() reflect.Type { return e.typ }
 func (e unaryBoundExpr) Nullable() bool     { return e.isNil }
@@ -985,40 +1233,7 @@ func (e binaryBoundExpr) Eval(ctx evalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch e.op {
-	case token.And:
-		return truthy(left) && truthy(right), nil
-	case token.Or:
-		return truthy(left) || truthy(right), nil
-	case token.Eq:
-		if left == nil || right == nil {
-			return false, nil
-		}
-		cmp, ok := compareValues(left, right)
-		return ok && cmp == 0, nil
-	case token.NEq:
-		if left == nil || right == nil {
-			return false, nil
-		}
-		cmp, ok := compareValues(left, right)
-		return ok && cmp != 0, nil
-	case token.Lt:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp < 0, nil
-	case token.LtE:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp <= 0, nil
-	case token.Gt:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp > 0, nil
-	case token.GtE:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp >= 0, nil
-	case token.Plus, token.Minus, token.Star, token.Slash:
-		return arithmetic(e.op, left, right)
-	default:
-		return nil, fmt.Errorf("unsupported binary operator")
-	}
+	return evalBinaryOp(e.op, left, right)
 }
 func (e binaryBoundExpr) Type() reflect.Type { return e.typ }
 func (e binaryBoundExpr) Nullable() bool     { return e.nullable }
@@ -1038,17 +1253,7 @@ func (e isBoundExpr) Eval(ctx evalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ok bool
-	if right == nil {
-		ok = left == nil
-	} else {
-		cmp, comparable := compareValues(left, right)
-		ok = comparable && cmp == 0
-	}
-	if e.negated {
-		ok = !ok
-	}
-	return ok, nil
+	return evalIsOp(left, right, e.negated), nil
 }
 func (e isBoundExpr) Type() reflect.Type { return reflect.TypeFor[bool]() }
 func (e isBoundExpr) Nullable() bool     { return false }
@@ -1064,25 +1269,15 @@ func (e inBoundExpr) Eval(ctx evalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if left == nil {
-		return false, nil
-	}
-	matched := false
+	right := make([]any, 0, len(e.right))
 	for _, expr := range e.right {
 		value, err := expr.Eval(ctx)
 		if err != nil {
 			return nil, err
 		}
-		cmp, ok := compareValues(left, value)
-		if ok && cmp == 0 {
-			matched = true
-			break
-		}
+		right = append(right, value)
 	}
-	if e.negated {
-		matched = !matched
-	}
-	return matched, nil
+	return evalInOp(left, right, e.negated), nil
 }
 func (e inBoundExpr) Type() reflect.Type { return reflect.TypeFor[bool]() }
 func (e inBoundExpr) Nullable() bool     { return false }
@@ -1176,8 +1371,10 @@ func (e scalarSubqueryExpr) cacheKey(ctx evalContext) (string, []Row, error) {
 		if i > 0 {
 			b.WriteString("|")
 		}
-		value := row[ref.index]
-		fmt.Fprintf(&b, "%d:%d:%T:%v", ref.level, ref.index, value, value)
+		fmt.Fprintf(&b, "%d:%d:", ref.level, ref.index)
+		if !appendValueKey(&b, row[ref.index]) {
+			return "", nil, fmt.Errorf("unsupported correlated subquery key type %T", row[ref.index])
+		}
 	}
 	return b.String(), childOuter, nil
 }
@@ -1291,6 +1488,12 @@ func bindExpr(ctx *plannerContext, expr ast.Expr, schema []relationColumn) (boun
 		}
 		return inBoundExpr{left: left, right: right, negated: expr.Negated}, nil
 	case ast.CallExpr:
+		if expr.Star {
+			return nil, fmt.Errorf("function %q does not accept *", expr.Name.Name)
+		}
+		if expr.Distinct {
+			return nil, fmt.Errorf("function %q does not accept DISTINCT arguments", expr.Name.Name)
+		}
 		if isAggregateName(expr.Name.Name) {
 			return nil, fmt.Errorf("aggregate function %q is not allowed in this context", expr.Name.Name)
 		}
@@ -1497,24 +1700,7 @@ func (e aggUnaryExpr) Eval(ctx aggEvalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch e.op {
-	case token.Not:
-		if value == nil {
-			return nil, nil
-		}
-		b, ok := value.(bool)
-		if !ok {
-			return nil, fmt.Errorf("NOT requires a boolean operand")
-		}
-		return !b, nil
-	case token.Minus:
-		if value == nil {
-			return nil, nil
-		}
-		return negateNumber(value)
-	default:
-		return nil, fmt.Errorf("unsupported unary operator")
-	}
+	return evalUnaryOp(e.op, value)
 }
 func (e aggUnaryExpr) Type() reflect.Type { return e.typ }
 func (e aggUnaryExpr) Nullable() bool     { return e.null }
@@ -1536,40 +1722,7 @@ func (e aggBinaryExpr) Eval(ctx aggEvalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	switch e.op {
-	case token.And:
-		return truthy(left) && truthy(right), nil
-	case token.Or:
-		return truthy(left) || truthy(right), nil
-	case token.Eq:
-		if left == nil || right == nil {
-			return false, nil
-		}
-		cmp, ok := compareValues(left, right)
-		return ok && cmp == 0, nil
-	case token.NEq:
-		if left == nil || right == nil {
-			return false, nil
-		}
-		cmp, ok := compareValues(left, right)
-		return ok && cmp != 0, nil
-	case token.Lt:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp < 0, nil
-	case token.LtE:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp <= 0, nil
-	case token.Gt:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp > 0, nil
-	case token.GtE:
-		cmp, ok := compareValues(left, right)
-		return ok && cmp >= 0, nil
-	case token.Plus, token.Minus, token.Star, token.Slash:
-		return arithmetic(e.op, left, right)
-	default:
-		return nil, fmt.Errorf("unsupported binary operator")
-	}
+	return evalBinaryOp(e.op, left, right)
 }
 func (e aggBinaryExpr) Type() reflect.Type { return e.typ }
 func (e aggBinaryExpr) Nullable() bool     { return e.null }
@@ -1589,17 +1742,7 @@ func (e aggIsExpr) Eval(ctx aggEvalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	var ok bool
-	if right == nil {
-		ok = left == nil
-	} else {
-		cmp, comparable := compareValues(left, right)
-		ok = comparable && cmp == 0
-	}
-	if e.negated {
-		ok = !ok
-	}
-	return ok, nil
+	return evalIsOp(left, right, e.negated), nil
 }
 func (e aggIsExpr) Type() reflect.Type { return reflect.TypeFor[bool]() }
 func (e aggIsExpr) Nullable() bool     { return false }
@@ -1615,25 +1758,15 @@ func (e aggInExpr) Eval(ctx aggEvalContext) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if left == nil {
-		return false, nil
-	}
-	matched := false
+	right := make([]any, 0, len(e.right))
 	for _, expr := range e.right {
 		value, err := expr.Eval(ctx)
 		if err != nil {
 			return nil, err
 		}
-		cmp, ok := compareValues(left, value)
-		if ok && cmp == 0 {
-			matched = true
-			break
-		}
+		right = append(right, value)
 	}
-	if e.negated {
-		matched = !matched
-	}
-	return matched, nil
+	return evalInOp(left, right, e.negated), nil
 }
 func (e aggInExpr) Type() reflect.Type { return reflect.TypeFor[bool]() }
 func (e aggInExpr) Nullable() bool     { return false }
@@ -1694,6 +1827,12 @@ func bindAggregateExpr(ctx *plannerContext, expr ast.Expr, schema []relationColu
 	case ast.NullLiteral:
 		return aggLiteralExpr{value: nil, typ: nil, null: true}, nil
 	case ast.CallExpr:
+		if expr.Star && !isAggregateName(expr.Name.Name) {
+			return nil, fmt.Errorf("function %q does not accept *", expr.Name.Name)
+		}
+		if expr.Distinct && !isAggregateName(expr.Name.Name) {
+			return nil, fmt.Errorf("function %q does not accept DISTINCT arguments", expr.Name.Name)
+		}
 		if !isAggregateName(expr.Name.Name) {
 			fn, err := lookupScalarFunction(ctx.db, expr.Name.Name, len(expr.Args))
 			if err != nil {
@@ -1790,6 +1929,12 @@ func collectAggregateSpecs(ctx *plannerContext, into map[string]aggregateSpec, e
 	switch expr := expr.(type) {
 	case ast.CallExpr:
 		if !isAggregateName(expr.Name.Name) {
+			if expr.Star {
+				return fmt.Errorf("function %q does not accept *", expr.Name.Name)
+			}
+			if expr.Distinct {
+				return fmt.Errorf("function %q does not accept DISTINCT arguments", expr.Name.Name)
+			}
 			for _, arg := range expr.Args {
 				if err := collectAggregateSpecs(ctx, into, arg, schema); err != nil {
 					return err
@@ -1797,27 +1942,44 @@ func collectAggregateSpecs(ctx *plannerContext, into map[string]aggregateSpec, e
 			}
 			return nil
 		}
-		if len(expr.Args) != 1 {
+		if expr.Star {
+			if expr.Distinct {
+				return fmt.Errorf("aggregate %s does not support DISTINCT *", expr.Name.Name)
+			}
+			if !strings.EqualFold(expr.Name.Name, "COUNT") {
+				return fmt.Errorf("aggregate %s does not support *", expr.Name.Name)
+			}
+		} else if len(expr.Args) != 1 {
 			return fmt.Errorf("aggregate %s requires exactly one argument", expr.Name.Name)
 		}
-		arg := expr.Args[0]
-		if containsAggregate(arg) {
-			return fmt.Errorf("nested aggregate functions are not supported")
+		var boundArg boundExpr
+		var err error
+		if !expr.Star {
+			arg := expr.Args[0]
+			if containsAggregate(arg) {
+				return fmt.Errorf("nested aggregate functions are not supported")
+			}
+			boundArg, err = bindExpr(ctx, arg, schema)
+			if err != nil {
+				return err
+			}
 		}
 		key := exprFingerprint(expr)
 		if _, exists := into[key]; exists {
 			return nil
 		}
-		boundArg, err := bindExpr(ctx, arg, schema)
-		if err != nil {
-			return err
-		}
 		name := strings.ToUpper(expr.Name.Name)
+		var argType reflect.Type
+		if boundArg != nil {
+			argType = boundArg.Type()
+		}
 		into[key] = aggregateSpec{
 			key:      key,
 			name:     name,
 			arg:      boundArg,
-			typ:      aggregateResultType(name, boundArg.Type()),
+			star:     expr.Star,
+			distinct: expr.Distinct,
+			typ:      aggregateResultType(name, argType),
 			nullable: aggregateNullable(name),
 		}
 		return nil
@@ -1935,31 +2097,41 @@ func aggregateNullable(name string) bool {
 func newAggregateState(spec aggregateSpec) aggregateState {
 	switch spec.name {
 	case "COUNT":
-		return &countAgg{arg: spec.arg}
+		return &countAgg{arg: spec.arg, star: spec.star, distinct: spec.distinct}
 	case "SUM":
-		return &sumAgg{arg: spec.arg}
+		return &sumAgg{arg: spec.arg, distinct: spec.distinct}
 	case "MIN":
-		return &minMaxAgg{arg: spec.arg, max: false}
+		return &minMaxAgg{arg: spec.arg, max: false, distinct: spec.distinct}
 	case "MAX":
-		return &minMaxAgg{arg: spec.arg, max: true}
+		return &minMaxAgg{arg: spec.arg, max: true, distinct: spec.distinct}
 	case "AVG":
-		return &avgAgg{arg: spec.arg}
+		return &avgAgg{arg: spec.arg, distinct: spec.distinct}
 	default:
 		panic("unsupported aggregate: " + spec.name)
 	}
 }
 
 type countAgg struct {
-	arg   boundExpr
-	count int64
+	arg      boundExpr
+	star     bool
+	distinct bool
+	seen     distinctTracker
+	count    int64
 }
 
 func (a *countAgg) Step(ctx evalContext) error {
+	if a.star {
+		a.count++
+		return nil
+	}
 	value, err := a.arg.Eval(ctx)
 	if err != nil {
 		return err
 	}
 	if value != nil {
+		if a.distinct && a.seen.Seen(value) {
+			return nil
+		}
 		a.count++
 	}
 	return nil
@@ -1967,11 +2139,13 @@ func (a *countAgg) Step(ctx evalContext) error {
 func (a *countAgg) Result() any { return a.count }
 
 type sumAgg struct {
-	arg   boundExpr
-	seen  bool
-	sumI  int64
-	sumF  float64
-	float bool
+	arg      boundExpr
+	distinct bool
+	seenVals distinctTracker
+	seen     bool
+	sumI     int64
+	sumF     float64
+	float    bool
 }
 
 func (a *sumAgg) Step(ctx evalContext) error {
@@ -1980,6 +2154,9 @@ func (a *sumAgg) Step(ctx evalContext) error {
 		return err
 	}
 	if value == nil {
+		return nil
+	}
+	if a.distinct && a.seenVals.Seen(value) {
 		return nil
 	}
 	if v, ok := asFloat64(value); ok {
@@ -2006,9 +2183,11 @@ func (a *sumAgg) Result() any {
 }
 
 type avgAgg struct {
-	arg   boundExpr
-	sum   float64
-	count int64
+	arg      boundExpr
+	distinct bool
+	seenVals distinctTracker
+	sum      float64
+	count    int64
 }
 
 func (a *avgAgg) Step(ctx evalContext) error {
@@ -2017,6 +2196,9 @@ func (a *avgAgg) Step(ctx evalContext) error {
 		return err
 	}
 	if value == nil {
+		return nil
+	}
+	if a.distinct && a.seenVals.Seen(value) {
 		return nil
 	}
 	if v, ok := asFloat64(value); ok {
@@ -2039,10 +2221,12 @@ func (a *avgAgg) Result() any {
 }
 
 type minMaxAgg struct {
-	arg  boundExpr
-	max  bool
-	seen bool
-	val  any
+	arg      boundExpr
+	max      bool
+	distinct bool
+	seenVals distinctTracker
+	seen     bool
+	val      any
 }
 
 func (a *minMaxAgg) Step(ctx evalContext) error {
@@ -2051,6 +2235,9 @@ func (a *minMaxAgg) Step(ctx evalContext) error {
 		return err
 	}
 	if value == nil {
+		return nil
+	}
+	if a.distinct && a.seenVals.Seen(value) {
 		return nil
 	}
 	if !a.seen {
@@ -2087,9 +2274,34 @@ func evaluateGroupKey(exprs []boundExpr, ctx evalContext) (string, error) {
 		if i > 0 {
 			b.WriteString("|")
 		}
-		fmt.Fprintf(&b, "%T:%v", value, value)
+		if !appendValueKey(&b, value) {
+			return "", fmt.Errorf("unsupported GROUP BY key type %T", value)
+		}
 	}
 	return b.String(), nil
+}
+
+type distinctTracker struct {
+	keyed    map[string]struct{}
+	fallback []any
+}
+
+func (t *distinctTracker) Seen(value any) bool {
+	if key, ok := valueHashKey(value); ok {
+		if t.keyed == nil {
+			t.keyed = make(map[string]struct{})
+		}
+		if _, exists := t.keyed[key]; exists {
+			return true
+		}
+		t.keyed[key] = struct{}{}
+		return false
+	}
+	if seenValue(t.fallback, value) {
+		return true
+	}
+	t.fallback = append(t.fallback, value)
+	return false
 }
 
 func exprFingerprint(expr ast.Expr) string {
@@ -2134,7 +2346,7 @@ func exprFingerprint(expr ast.Expr) string {
 		for i, arg := range expr.Args {
 			parts[i] = exprFingerprint(arg)
 		}
-		return fmt.Sprintf("call:%s(%s)", strings.ToLower(expr.Name.Name), strings.Join(parts, ","))
+		return fmt.Sprintf("call:%s:%t:%t(%s)", strings.ToLower(expr.Name.Name), expr.Distinct, expr.Star, strings.Join(parts, ","))
 	case ast.SubqueryExpr:
 		return fmt.Sprintf("subq:%d:%d", expr.Span().Start, expr.Span().End)
 	default:
@@ -2280,6 +2492,96 @@ func truthy(value any) bool {
 	default:
 		return false
 	}
+}
+
+func evalUnaryOp(op token.Type, value any) (any, error) {
+	switch op {
+	case token.Not:
+		if value == nil {
+			return nil, nil
+		}
+		b, ok := value.(bool)
+		if !ok {
+			return nil, fmt.Errorf("NOT requires a boolean operand")
+		}
+		return !b, nil
+	case token.Minus:
+		if value == nil {
+			return nil, nil
+		}
+		return negateNumber(value)
+	default:
+		return nil, fmt.Errorf("unsupported unary operator")
+	}
+}
+
+func evalBinaryOp(op token.Type, left, right any) (any, error) {
+	switch op {
+	case token.And:
+		return truthy(left) && truthy(right), nil
+	case token.Or:
+		return truthy(left) || truthy(right), nil
+	case token.Eq:
+		if left == nil || right == nil {
+			return false, nil
+		}
+		cmp, ok := compareValues(left, right)
+		return ok && cmp == 0, nil
+	case token.NEq:
+		if left == nil || right == nil {
+			return false, nil
+		}
+		cmp, ok := compareValues(left, right)
+		return ok && cmp != 0, nil
+	case token.Lt:
+		cmp, ok := compareValues(left, right)
+		return ok && cmp < 0, nil
+	case token.LtE:
+		cmp, ok := compareValues(left, right)
+		return ok && cmp <= 0, nil
+	case token.Gt:
+		cmp, ok := compareValues(left, right)
+		return ok && cmp > 0, nil
+	case token.GtE:
+		cmp, ok := compareValues(left, right)
+		return ok && cmp >= 0, nil
+	case token.Plus, token.Minus, token.Star, token.Slash:
+		return arithmetic(op, left, right)
+	default:
+		return nil, fmt.Errorf("unsupported binary operator")
+	}
+}
+
+func evalIsOp(left, right any, negated bool) bool {
+	var ok bool
+	if right == nil {
+		ok = left == nil
+	} else {
+		cmp, comparable := compareValues(left, right)
+		ok = comparable && cmp == 0
+	}
+	if negated {
+		ok = !ok
+	}
+	return ok
+}
+
+func evalInOp(left any, right []any, negated bool) bool {
+	if left == nil {
+		return false
+	}
+	matched := false
+	for _, value := range right {
+		cmp, ok := compareValues(left, value)
+		if ok && cmp == 0 {
+			matched = true
+			break
+		}
+	}
+	if negated {
+		matched = !matched
+	}
+	return matched
 }
 
 func negateNumber(value any) (any, error) {
@@ -2433,6 +2735,224 @@ func compareValues(left, right any) (int, bool) {
 func valuesEqual(left, right any) (bool, bool) {
 	cmp, ok := compareValues(left, right)
 	return ok && cmp == 0, ok
+}
+
+func seenValue(values []any, target any) bool {
+	for _, existing := range values {
+		if eq, ok := valuesEqual(existing, target); ok && eq {
+			return true
+		}
+		if reflect.DeepEqual(existing, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func rowHashKey(row Row) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(row) * 16)
+	for i, value := range row {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		if !appendValueKey(&b, value) {
+			return "", false
+		}
+	}
+	return b.String(), true
+}
+
+func valueHashKey(value any) (string, bool) {
+	var b strings.Builder
+	if !appendValueKey(&b, value) {
+		return "", false
+	}
+	return b.String(), true
+}
+
+func appendValueKey(b *strings.Builder, value any) bool {
+	return appendReflectValueKey(b, reflect.ValueOf(value))
+}
+
+func appendReflectValueKey(b *strings.Builder, value reflect.Value) bool {
+	if !value.IsValid() {
+		b.WriteString("nil")
+		return true
+	}
+	for value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			b.WriteString("nil")
+			return true
+		}
+		b.WriteString("*")
+		value = value.Elem()
+	}
+
+	if value.CanInterface() {
+		if t, ok := value.Interface().(time.Time); ok {
+			b.WriteString("time:")
+			b.WriteString(strconv.FormatInt(t.UnixNano(), 10))
+			return true
+		}
+	}
+
+	switch value.Kind() {
+	case reflect.Bool:
+		b.WriteString("b:")
+		if value.Bool() {
+			b.WriteByte('1')
+		} else {
+			b.WriteByte('0')
+		}
+		return true
+	case reflect.String:
+		b.WriteString("s:")
+		b.WriteString(value.String())
+		return true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		b.WriteString("i:")
+		b.WriteString(strconv.FormatInt(value.Int(), 10))
+		return true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		b.WriteString("u:")
+		b.WriteString(strconv.FormatUint(value.Uint(), 10))
+		return true
+	case reflect.Float32, reflect.Float64:
+		b.WriteString("f:")
+		b.WriteString(strconv.FormatUint(math.Float64bits(value.Convert(reflect.TypeFor[float64]()).Float()), 16))
+		return true
+	case reflect.Slice, reflect.Array:
+		b.WriteString("a[")
+		for i := range value.Len() {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if !appendReflectValueKey(b, value.Index(i)) {
+				return false
+			}
+		}
+		b.WriteByte(']')
+		return true
+	case reflect.Map:
+		b.WriteString("m{")
+		type pair struct {
+			key string
+			val reflect.Value
+		}
+		pairs := make([]pair, 0, value.Len())
+		iter := value.MapRange()
+		for iter.Next() {
+			key, ok := valueHashKey(iter.Key().Interface())
+			if !ok {
+				return false
+			}
+			pairs = append(pairs, pair{key: key, val: iter.Value()})
+		}
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
+		for i, item := range pairs {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(item.key)
+			b.WriteByte(':')
+			if !appendReflectValueKey(b, item.val) {
+				return false
+			}
+		}
+		b.WriteByte('}')
+		return true
+	case reflect.Struct:
+		b.WriteString("struct:")
+		b.WriteString(value.Type().String())
+		b.WriteByte('{')
+		for i := range value.NumField() {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			field := value.Type().Field(i)
+			b.WriteString(field.Name)
+			b.WriteByte(':')
+			if !appendReflectValueKey(b, value.Field(i)) {
+				return false
+			}
+		}
+		b.WriteByte('}')
+		return true
+	default:
+		if value.CanInterface() && value.Type().Comparable() {
+			b.WriteString("c:")
+			b.WriteString(value.Type().String())
+			b.WriteByte(':')
+			b.WriteString(fmt.Sprint(value.Interface()))
+			return true
+		}
+		return false
+	}
+}
+
+func compareOrderKeys(keys [][]any, terms []orderTermPlan, leftIdx, rightIdx int) int {
+	for termIdx, term := range terms {
+		cmp, ok := compareValues(keys[termIdx][leftIdx], keys[termIdx][rightIdx])
+		if !ok || cmp == 0 {
+			continue
+		}
+		if term.desc {
+			return -cmp
+		}
+		return cmp
+	}
+	return 0
+}
+
+type topNIndexHeap struct {
+	indices []int
+	keys    [][]any
+	terms   []orderTermPlan
+}
+
+func (h topNIndexHeap) Len() int { return len(h.indices) }
+
+func (h topNIndexHeap) Less(i, j int) bool {
+	return compareOrderKeys(h.keys, h.terms, h.indices[i], h.indices[j]) > 0
+}
+
+func (h topNIndexHeap) Swap(i, j int) {
+	h.indices[i], h.indices[j] = h.indices[j], h.indices[i]
+}
+
+func (h *topNIndexHeap) Push(x any) {
+	h.indices = append(h.indices, x.(int))
+}
+
+func (h *topNIndexHeap) Pop() any {
+	last := len(h.indices) - 1
+	item := h.indices[last]
+	h.indices = h.indices[:last]
+	return item
+}
+
+func topNIndices(all []int, limit int, keys [][]any, terms []orderTermPlan) []int {
+	h := &topNIndexHeap{
+		indices: make([]int, 0, limit),
+		keys:    keys,
+		terms:   terms,
+	}
+	for _, idx := range all {
+		if h.Len() < limit {
+			heap.Push(h, idx)
+			continue
+		}
+		if compareOrderKeys(keys, terms, idx, h.indices[0]) < 0 {
+			h.indices[0] = idx
+			heap.Fix(h, 0)
+		}
+	}
+	out := append([]int(nil), h.indices...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return compareOrderKeys(keys, terms, out[i], out[j]) < 0
+	})
+	return out
 }
 
 func asInt64(value any) (int64, bool) {

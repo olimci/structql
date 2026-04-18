@@ -65,6 +65,34 @@ func TestParseQueryFullSurface(t *testing.T) {
 	}
 }
 
+func TestParseDistinctAndHaving(t *testing.T) {
+	t.Parallel()
+
+	input := "SELECT DISTINCT city_id, count(age) AS cnt FROM users GROUP BY city_id HAVING count(age) > 1 ORDER BY city_id ASC LIMIT 5"
+
+	p := New(input)
+	query, err := p.ParseQuery()
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	if !query.Distinct {
+		t.Fatalf("expected DISTINCT flag")
+	}
+	if len(query.GroupBy) != 1 {
+		t.Fatalf("unexpected group by: %#v", query.GroupBy)
+	}
+	if _, ok := query.Having.(ast.BinaryExpr); !ok {
+		t.Fatalf("unexpected having expr: %#v", query.Having)
+	}
+	if len(query.OrderBy) != 1 || query.OrderBy[0].Desc {
+		t.Fatalf("unexpected order by: %#v", query.OrderBy)
+	}
+	if limit, ok := query.Limit.(ast.NumberLiteral); !ok || limit.Raw != "5" {
+		t.Fatalf("unexpected limit: %#v", query.Limit)
+	}
+}
+
 func TestParseExpressionPrecedence(t *testing.T) {
 	t.Parallel()
 
@@ -115,6 +143,67 @@ func TestParseCallAndNotIn(t *testing.T) {
 	inExpr, ok := query.Where.(ast.InExpr)
 	if !ok || !inExpr.Negated || len(inExpr.Right) != 2 {
 		t.Fatalf("unexpected NOT IN expr: %#v", query.Where)
+	}
+}
+
+func TestParseAggregateCallModifiers(t *testing.T) {
+	t.Parallel()
+
+	p := New("SELECT count(*), sum(distinct age) FROM users")
+	query, err := p.ParseQuery()
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	countCall, ok := query.Select[0].Expr.(ast.CallExpr)
+	if !ok || !countCall.Star || countCall.Distinct || len(countCall.Args) != 0 {
+		t.Fatalf("unexpected count(*) call: %#v", query.Select[0].Expr)
+	}
+
+	sumCall, ok := query.Select[1].Expr.(ast.CallExpr)
+	if !ok || !sumCall.Distinct || sumCall.Star || len(sumCall.Args) != 1 {
+		t.Fatalf("unexpected sum(distinct ...) call: %#v", query.Select[1].Expr)
+	}
+}
+
+func TestParseTableFunction(t *testing.T) {
+	t.Parallel()
+
+	input := "SELECT tag.value FROM profiles p JOIN unnest(p.tags) tag ON true"
+
+	p := New(input)
+	query, err := p.ParseQuery()
+	if err != nil {
+		t.Fatalf("unexpected parse error: %v", err)
+	}
+
+	if len(query.Joins) != 1 {
+		t.Fatalf("unexpected joins: %#v", query.Joins)
+	}
+	if query.Joins[0].Table.Function == nil {
+		t.Fatalf("expected table function ref: %#v", query.Joins[0].Table)
+	}
+	if query.Joins[0].Table.Function.Name.Name != "unnest" {
+		t.Fatalf("unexpected table function: %#v", query.Joins[0].Table.Function)
+	}
+	if query.Joins[0].Table.Alias == nil || query.Joins[0].Table.Alias.Name != "tag" {
+		t.Fatalf("unexpected table alias: %#v", query.Joins[0].Table.Alias)
+	}
+	if len(query.Joins[0].Table.Function.Args) != 1 {
+		t.Fatalf("unexpected arg count: %#v", query.Joins[0].Table.Function.Args)
+	}
+}
+
+func TestParseTableFunctionRequiresAlias(t *testing.T) {
+	t.Parallel()
+
+	p := New("SELECT value FROM unnest(tags)")
+	query, errs := p.ParseQueryWithErrors()
+	if query == nil {
+		t.Fatalf("expected partial query")
+	}
+	if len(errs) == 0 {
+		t.Fatalf("expected parse errors")
 	}
 }
 

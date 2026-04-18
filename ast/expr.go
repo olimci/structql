@@ -189,9 +189,11 @@ func NewIsExpr(span Span, left Expr, right Expr, negated bool) IsExpr {
 }
 
 type CallExpr struct {
-	span Span
-	Name Identifier
-	Args []Expr
+	span     Span
+	Name     Identifier
+	Args     []Expr
+	Distinct bool
+	Star     bool
 }
 
 func (c CallExpr) Span() Span {
@@ -202,6 +204,10 @@ func (CallExpr) exprNode() {}
 
 func NewCallExpr(span Span, name Identifier, args []Expr) CallExpr {
 	return CallExpr{span: span, Name: name, Args: args}
+}
+
+func NewCallExprWithModifiers(span Span, name Identifier, args []Expr, distinct, star bool) CallExpr {
+	return CallExpr{span: span, Name: name, Args: args, Distinct: distinct, Star: star}
 }
 
 type SubqueryExpr struct {

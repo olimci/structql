@@ -47,6 +47,11 @@ type timedRow struct {
 	CreatedAt time.Time `structql:"created_at"`
 }
 
+type tagProfile struct {
+	ID   int      `structql:"id"`
+	Tags []string `structql:"tags"`
+}
+
 func TestBuildTableSchemaAndTags(t *testing.T) {
 	t.Parallel()
 
@@ -161,6 +166,90 @@ func TestOrderByTime(t *testing.T) {
 	}
 	if got := []any{asc.Rows[0][0], asc.Rows[1][0], asc.Rows[2][0]}; !reflect.DeepEqual(got, []any{1, 3, 2}) {
 		t.Fatalf("unexpected asc order: %#v", got)
+	}
+}
+
+func TestUnnestJoin(t *testing.T) {
+	t.Parallel()
+
+	rows, err := BuildTable([]tagProfile{
+		{ID: 1, Tags: []string{"vip", "beta"}},
+		{ID: 2, Tags: []string{"basic"}},
+		{ID: 3, Tags: nil},
+		{ID: 4, Tags: []string{}},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("profiles", rows); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	result, err := db.Query("select p.id, tag.value from profiles p join unnest(p.tags) tag on true order by p.id asc, tag.value asc")
+	if err != nil {
+		t.Fatalf("unnest join query failed: %v", err)
+	}
+	if got := len(result.Rows); got != 3 {
+		t.Fatalf("unexpected row count: %d", got)
+	}
+	if result.Rows[0][0] != 1 || result.Rows[0][1] != "beta" {
+		t.Fatalf("unexpected first row: %#v", result.Rows[0])
+	}
+	if result.Rows[1][0] != 1 || result.Rows[1][1] != "vip" {
+		t.Fatalf("unexpected second row: %#v", result.Rows[1])
+	}
+	if result.Rows[2][0] != 2 || result.Rows[2][1] != "basic" {
+		t.Fatalf("unexpected third row: %#v", result.Rows[2])
+	}
+
+	grouped, err := db.Query("select tag.value, count(p.id) from profiles p join unnest(p.tags) tag on true group by tag.value order by tag.value asc")
+	if err != nil {
+		t.Fatalf("unnest group query failed: %v", err)
+	}
+	if len(grouped.Rows) != 3 {
+		t.Fatalf("unexpected grouped rows: %#v", grouped.Rows)
+	}
+	if grouped.Rows[0][0] != "basic" || grouped.Rows[0][1] != int64(1) {
+		t.Fatalf("unexpected grouped first row: %#v", grouped.Rows[0])
+	}
+
+	leftJoined, err := db.Query("select p.id, tag.value from profiles p left join unnest(p.tags) tag on true order by p.id asc")
+	if err != nil {
+		t.Fatalf("unnest left join query failed: %v", err)
+	}
+	if len(leftJoined.Rows) != 5 {
+		t.Fatalf("unexpected left join rows: %#v", leftJoined.Rows)
+	}
+	if leftJoined.Rows[3][0] != 3 || leftJoined.Rows[3][1] != nil {
+		t.Fatalf("expected nil expansion for nil tags: %#v", leftJoined.Rows[3])
+	}
+	if leftJoined.Rows[4][0] != 4 || leftJoined.Rows[4][1] != nil {
+		t.Fatalf("expected nil expansion for empty tags: %#v", leftJoined.Rows[4])
+	}
+}
+
+func TestUnnestErrors(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, Visible: "Ada"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	if _, err := db.Query("select * from users u join unnest(u.name) part on true"); err == nil {
+		t.Fatalf("expected non-slice unnest error")
+	}
+	if _, err := db.Query("select * from users u right join unnest(?) part on true", []string{"x"}); err == nil {
+		t.Fatalf("expected right join lateral unsupported error")
 	}
 }
 
@@ -446,6 +535,72 @@ func TestRequiredArgsParseError(t *testing.T) {
 	}
 }
 
+func TestPrepareQueryReusesParsedQuery(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{{ID: 1, Name: "Ada", Age: 30, Active: true, Visible: "Ada"}})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	first, err := db.Prepare("select name from users where id = ?")
+	if err != nil {
+		t.Fatalf("Prepare failed: %v", err)
+	}
+	second, err := db.Prepare("select name from users where id = ?")
+	if err != nil {
+		t.Fatalf("Prepare failed: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected identical prepared query pointer from cache")
+	}
+
+	result, err := first.Query(db, 1)
+	if err != nil {
+		t.Fatalf("Prepared query failed: %v", err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != "Ada" {
+		t.Fatalf("unexpected prepared query result: %#v", result.Rows)
+	}
+}
+
+func TestPreparedQueryValidatesArgs(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{{ID: 1, Name: "Ada", Age: 30, Active: true, Visible: "Ada"}})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	prepared, err := db.Prepare("select ?, @label from users limit @limit")
+	if err != nil {
+		t.Fatalf("Prepare failed: %v", err)
+	}
+
+	if _, err := prepared.Query(db, 1, Named("label", "x"), Named("limit", 1)); err != nil {
+		t.Fatalf("prepared query unexpectedly failed: %v", err)
+	}
+	if _, err := prepared.Query(db, Named("label", "x"), Named("limit", 1)); err == nil {
+		t.Fatalf("expected missing positional arg error")
+	}
+	if _, err := prepared.Query(db, 1, Named("label", "x")); err == nil {
+		t.Fatalf("expected missing named arg error")
+	}
+	if _, err := prepared.Query(db, 1, Named("label", "x"), Named("limit", 1), Named("extra", true)); err == nil {
+		t.Fatalf("expected extra named arg error")
+	}
+}
+
 func TestQueryCaseInsensitiveResolution(t *testing.T) {
 	t.Parallel()
 
@@ -647,6 +802,164 @@ func TestQueryGlobalAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregateCountStarAndDistinct(t *testing.T) {
+	t.Parallel()
+
+	city1 := 1
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, CityID: &city1, Visible: "Ada"},
+		{ID: 2, Name: "Alan", Age: 30, Active: true, CityID: &city1, Visible: "Alan"},
+		{ID: 3, Name: "Bob", Age: 25, Active: false, CityID: nil, Visible: "Bob"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	result, err := db.Query("select count(*) as total_rows, count(distinct age) as distinct_ages, sum(distinct age) as total_age, avg(distinct age) as avg_age from users")
+	if err != nil {
+		t.Fatalf("aggregate modifier query failed: %v", err)
+	}
+	if len(result.Rows) != 1 {
+		t.Fatalf("unexpected row count: %#v", result.Rows)
+	}
+	if result.Rows[0][0] != int64(3) || result.Rows[0][1] != int64(2) || result.Rows[0][2] != int64(55) || result.Rows[0][3] != 27.5 {
+		t.Fatalf("unexpected aggregate modifier row: %#v", result.Rows[0])
+	}
+
+	grouped, err := db.Query("select city_id, count(*) as cnt, count(distinct age) as age_cnt from users group by city_id order by city_id asc")
+	if err != nil {
+		t.Fatalf("grouped aggregate modifier query failed: %v", err)
+	}
+	if len(grouped.Rows) != 2 {
+		t.Fatalf("unexpected grouped rows: %#v", grouped.Rows)
+	}
+	if grouped.Rows[0][0] != 1 || grouped.Rows[0][1] != int64(2) || grouped.Rows[0][2] != int64(1) {
+		t.Fatalf("unexpected city aggregate row: %#v", grouped.Rows[0])
+	}
+	if grouped.Rows[1][0] != nil || grouped.Rows[1][1] != int64(1) || grouped.Rows[1][2] != int64(1) {
+		t.Fatalf("unexpected nil city aggregate row: %#v", grouped.Rows[1])
+	}
+}
+
+func TestAggregateCountStarEmptyInput(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	result, err := db.Query("select count(*) as total_rows from users")
+	if err != nil {
+		t.Fatalf("empty count(*) query failed: %v", err)
+	}
+	if len(result.Rows) != 1 || result.Rows[0][0] != int64(0) {
+		t.Fatalf("unexpected empty count(*) result: %#v", result.Rows)
+	}
+}
+
+func TestInvalidFunctionModifiers(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, Visible: "Ada"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	if _, err := db.Query("select len(*) from users"); err == nil {
+		t.Fatalf("expected scalar function star error")
+	}
+	if _, err := db.Query("select len(distinct name) from users"); err == nil {
+		t.Fatalf("expected scalar function DISTINCT error")
+	}
+	if _, err := db.Query("select sum(*) from users"); err == nil {
+		t.Fatalf("expected non-count aggregate star error")
+	}
+}
+
+func TestQueryHavingAndDistinct(t *testing.T) {
+	t.Parallel()
+
+	city1 := 1
+	city2 := 2
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, CityID: &city1, Visible: "Ada"},
+		{ID: 2, Name: "Alan", Age: 25, Active: true, CityID: &city1, Visible: "Alan"},
+		{ID: 3, Name: "Bob", Age: 40, Active: false, CityID: &city2, Visible: "Bob"},
+		{ID: 4, Name: "Beth", Age: 40, Active: true, CityID: &city2, Visible: "Beth"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	having, err := db.Query("select city_id, count(age) as cnt from users group by city_id having count(age) > 1 order by city_id asc")
+	if err != nil {
+		t.Fatalf("HAVING query failed: %v", err)
+	}
+	if len(having.Rows) != 2 {
+		t.Fatalf("unexpected HAVING rows: %#v", having.Rows)
+	}
+	if having.Rows[0][0] != 1 || having.Rows[0][1] != int64(2) {
+		t.Fatalf("unexpected first HAVING row: %#v", having.Rows[0])
+	}
+	if having.Rows[1][0] != 2 || having.Rows[1][1] != int64(2) {
+		t.Fatalf("unexpected second HAVING row: %#v", having.Rows[1])
+	}
+
+	distinct, err := db.Query("select distinct age from users order by age desc limit 2")
+	if err != nil {
+		t.Fatalf("DISTINCT query failed: %v", err)
+	}
+	if len(distinct.Rows) != 2 {
+		t.Fatalf("unexpected DISTINCT rows: %#v", distinct.Rows)
+	}
+	if distinct.Rows[0][0] != 40 || distinct.Rows[1][0] != 30 {
+		t.Fatalf("unexpected DISTINCT ordering/limit rows: %#v", distinct.Rows)
+	}
+}
+
+func TestHavingRequiresAggregateContext(t *testing.T) {
+	t.Parallel()
+
+	users, err := BuildTable([]testUser{
+		{ID: 1, Name: "Ada", Age: 30, Active: true, Visible: "Ada"},
+	})
+	if err != nil {
+		t.Fatalf("BuildTable failed: %v", err)
+	}
+
+	db := NewDB()
+	if err := db.Register("users", users); err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+
+	if _, err := db.Query("select name from users having name = 'Ada'"); err == nil {
+		t.Fatalf("expected HAVING error without aggregate context")
+	}
+}
+
 func TestSelectWildcardRejectedInAggregateQuery(t *testing.T) {
 	t.Parallel()
 
@@ -754,7 +1067,7 @@ func TestCorrelatedScalarSubqueryMemoizesByOuterKey(t *testing.T) {
 	if len(result.Rows) != 3 {
 		t.Fatalf("unexpected rows: %#v", result.Rows)
 	}
-	if calls != 8 {
+	if calls != 4 {
 		t.Fatalf("expected correlated subquery memoization by key, got %d column reads", calls)
 	}
 }

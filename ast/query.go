@@ -1,14 +1,16 @@
 package ast
 
 type Query struct {
-	span    Span
-	Select  []SelectItem
-	From    []TableRef
-	Joins   []Join
-	Where   Expr
-	GroupBy []Expr
-	OrderBy []OrderTerm
-	Limit   Expr
+	span     Span
+	Distinct bool
+	Select   []SelectItem
+	From     []TableRef
+	Joins    []Join
+	Where    Expr
+	GroupBy  []Expr
+	Having   Expr
+	OrderBy  []OrderTerm
+	Limit    Expr
 }
 
 func (q Query) Span() Span {
@@ -56,6 +58,7 @@ type TableRef struct {
 	span     Span
 	Name     *QualifiedRef
 	Subquery *Query
+	Function *CallExpr
 	Alias    *Identifier
 }
 
@@ -69,6 +72,10 @@ func NewNamedTableRef(span Span, name QualifiedRef, alias *Identifier) TableRef 
 
 func NewSubqueryTableRef(span Span, query *Query, alias *Identifier) TableRef {
 	return TableRef{span: span, Subquery: query, Alias: alias}
+}
+
+func NewFunctionTableRef(span Span, call CallExpr, alias *Identifier) TableRef {
+	return TableRef{span: span, Function: &call, Alias: alias}
 }
 
 func (t *TableRef) SetSpan(span Span) {

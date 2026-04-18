@@ -12,6 +12,15 @@ func RequiredArgs(query string) (int, []string, error) {
 		return 0, nil, err
 	}
 
+	positional, named := requiredArgsFromAST(parsed)
+	return positional, named, nil
+}
+
+func requiredArgsFromAST(parsed *ast.Query) (int, []string) {
+	if parsed == nil {
+		return 0, nil
+	}
+
 	maxPositional := -1
 	named := make([]string, 0)
 	seenNamed := make(map[string]struct{})
@@ -61,6 +70,11 @@ func RequiredArgs(query string) (int, []string, error) {
 		if ref.Subquery != nil {
 			visitQuery(ref.Subquery)
 		}
+		if ref.Function != nil {
+			for _, arg := range ref.Function.Args {
+				visitExpr(arg)
+			}
+		}
 	}
 
 	visitQuery = func(query *ast.Query) {
@@ -81,6 +95,7 @@ func RequiredArgs(query string) (int, []string, error) {
 		for _, expr := range query.GroupBy {
 			visitExpr(expr)
 		}
+		visitExpr(query.Having)
 		for _, term := range query.OrderBy {
 			visitExpr(term.Expr)
 		}
@@ -89,5 +104,5 @@ func RequiredArgs(query string) (int, []string, error) {
 
 	visitQuery(parsed)
 
-	return maxPositional + 1, named, nil
+	return maxPositional + 1, named
 }

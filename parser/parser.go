@@ -68,6 +68,10 @@ func (p *Parser) parseQuery() *ast.Query {
 	}
 
 	query := ast.NewQuery(ast.Span{})
+	if p.cur.Type == token.Distinct {
+		query.Distinct = true
+		p.advance()
+	}
 	query.Select = p.parseSelectList()
 
 	fromTok, ok := p.expect(token.From, "expected FROM after SELECT list")
@@ -91,12 +95,21 @@ func (p *Parser) parseQuery() *ast.Query {
 		query.Where = p.parseExpression(precLowest)
 		if query.Where == nil {
 			p.errorAtCurrent("expected expression after WHERE", nil)
-			p.syncTo(token.Group, token.Order, token.Limit, token.EOF)
+			p.syncTo(token.Group, token.Having, token.Order, token.Limit, token.EOF)
 		}
 	}
 
 	if p.cur.Type == token.Group {
 		query.GroupBy = p.parseGroupBy()
+	}
+
+	if p.cur.Type == token.Having {
+		p.advance()
+		query.Having = p.parseExpression(precLowest)
+		if query.Having == nil {
+			p.errorAtCurrent("expected expression after HAVING", nil)
+			p.syncTo(token.Order, token.Limit, token.EOF)
+		}
 	}
 
 	if p.cur.Type == token.Order {
@@ -123,6 +136,9 @@ func (p *Parser) parseQuery() *ast.Query {
 	}
 	if query.Where != nil {
 		last = query.Where.Span()
+	}
+	if query.Having != nil {
+		last = query.Having.Span()
 	}
 	if len(query.OrderBy) > 0 {
 		last = query.OrderBy[len(query.OrderBy)-1].Span()
@@ -203,7 +219,7 @@ func (p *Parser) parseFromList() []ast.TableRef {
 		ref := p.parseTableRef()
 		if ref == nil {
 			p.errorAtCurrent("expected table reference after FROM", nil)
-			p.syncTo(token.Where, token.Join, token.Left, token.Right, token.Inner, token.Group, token.Order, token.Limit, token.EOF)
+			p.syncTo(token.Where, token.Join, token.Left, token.Right, token.Inner, token.Group, token.Having, token.Order, token.Limit, token.EOF)
 			return refs
 		}
 		refs = append(refs, *ref)
@@ -245,12 +261,54 @@ func (p *Parser) parseTableRef() *ast.TableRef {
 		return &ref
 	}
 
-	name := p.parseQualifiedRef()
+	if p.cur.Type != token.Identifier {
+		return nil
+	}
+
+	name := p.parseIdentifier()
 	if name == nil {
 		return nil
 	}
 
-	ref := ast.NewNamedTableRef(name.Span(), *name, nil)
+	if p.cur.Type == token.LParen {
+		callExpr, ok := p.parseCallExpr(*name).(ast.CallExpr)
+		if !ok {
+			p.errorAtCurrent("expected table function call", nil)
+			return nil
+		}
+
+		var alias *ast.Identifier
+		if p.cur.Type == token.As {
+			p.advance()
+			alias = p.parseIdentifier()
+		} else if p.cur.Type == token.Identifier {
+			alias = p.parseIdentifier()
+		}
+		if alias == nil {
+			p.errorAtCurrent("table functions require an alias", []string{"identifier"})
+			return nil
+		}
+
+		ref := ast.NewFunctionTableRef(callExpr.Span(), callExpr, alias)
+		ref.SetSpan(ast.MergeSpan(ref.Span(), alias.Span()))
+		return &ref
+	}
+
+	parts := []ast.Identifier{*name}
+	end := name.Span()
+	for p.cur.Type == token.Dot {
+		p.advance()
+		next := p.parseIdentifier()
+		if next == nil {
+			p.errorAtCurrent("expected identifier after .", []string{"identifier"})
+			break
+		}
+		parts = append(parts, *next)
+		end = next.Span()
+	}
+
+	qualified := ast.NewQualifiedRef(ast.MergeSpan(name.Span(), end), parts)
+	ref := ast.NewNamedTableRef(qualified.Span(), qualified, nil)
 
 	if p.cur.Type == token.As {
 		p.advance()
@@ -304,7 +362,7 @@ func (p *Parser) parseJoin() *ast.Join {
 	ref := p.parseTableRef()
 	if ref == nil {
 		p.errorAtCurrent("expected table reference after JOIN", nil)
-		p.syncTo(token.On, token.Where, token.Group, token.Order, token.Limit, token.EOF)
+		p.syncTo(token.On, token.Where, token.Group, token.Having, token.Order, token.Limit, token.EOF)
 		return nil
 	}
 
@@ -316,7 +374,7 @@ func (p *Parser) parseJoin() *ast.Join {
 	on := p.parseExpression(precLowest)
 	if on == nil {
 		p.errorAtCurrent("expected expression after ON", nil)
-		p.syncTo(token.Where, token.Group, token.Order, token.Limit, token.EOF)
+		p.syncTo(token.Where, token.Group, token.Having, token.Order, token.Limit, token.EOF)
 		join := ast.NewJoin(ast.MergeSpan(spanFromToken(start), ref.Span()), kind, *ref, nil)
 		return &join
 	}
@@ -336,7 +394,7 @@ func (p *Parser) parseGroupBy() []ast.Expr {
 		expr := p.parseExpression(precLowest)
 		if expr == nil {
 			p.errorAtCurrent("expected expression in GROUP BY", nil)
-			p.syncTo(token.Comma, token.Order, token.Limit, token.EOF)
+			p.syncTo(token.Comma, token.Having, token.Order, token.Limit, token.EOF)
 			return exprs
 		}
 		exprs = append(exprs, expr)
@@ -522,18 +580,29 @@ func (p *Parser) parseCallExpr(name ast.Identifier) ast.Expr {
 	p.advance()
 
 	var args []ast.Expr
-	if p.cur.Type != token.RParen {
-		for {
-			arg := p.parseExpression(precLowest)
-			if arg == nil {
-				p.errorAtCurrent("expected expression in function call", nil)
-				break
-			}
-			args = append(args, arg)
-			if p.cur.Type != token.Comma {
-				break
-			}
+	distinct := false
+	star := false
+	if p.cur.Type == token.Star {
+		star = true
+		p.advance()
+	} else {
+		if p.cur.Type == token.Distinct {
+			distinct = true
 			p.advance()
+		}
+		if p.cur.Type != token.RParen {
+			for {
+				arg := p.parseExpression(precLowest)
+				if arg == nil {
+					p.errorAtCurrent("expected expression in function call", nil)
+					break
+				}
+				args = append(args, arg)
+				if p.cur.Type != token.Comma {
+					break
+				}
+				p.advance()
+			}
 		}
 	}
 
@@ -544,7 +613,7 @@ func (p *Parser) parseCallExpr(name ast.Identifier) ast.Expr {
 		end = args[len(args)-1].Span()
 	}
 
-	return ast.NewCallExpr(ast.MergeSpan(start, end), name, args)
+	return ast.NewCallExprWithModifiers(ast.MergeSpan(start, end), name, args, distinct, star)
 }
 
 func (p *Parser) parseBinaryExpr(left ast.Expr) ast.Expr {
@@ -697,7 +766,7 @@ func (p *Parser) isJoinStart() bool {
 
 func (p *Parser) expressionTerminated() bool {
 	switch p.cur.Type {
-	case token.EOF, token.Comma, token.From, token.Where, token.Join, token.Left, token.Right, token.Inner, token.On, token.Group, token.Order, token.By, token.Limit, token.Asc, token.Desc, token.RParen:
+	case token.EOF, token.Comma, token.From, token.Where, token.Join, token.Left, token.Right, token.Inner, token.On, token.Group, token.Having, token.Order, token.By, token.Limit, token.Asc, token.Desc, token.RParen:
 		return true
 	default:
 		return false

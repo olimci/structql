@@ -31,6 +31,7 @@ const (
 	Percent
 
 	Select
+	Distinct
 	From
 	Where
 	Join
@@ -42,6 +43,7 @@ const (
 	Order
 	Group
 	By
+	Having
 	Limit
 	Asc
 	Desc

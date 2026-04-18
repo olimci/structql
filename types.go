@@ -1,6 +1,9 @@
 package structql
 
-import "reflect"
+import (
+	"reflect"
+	"sync"
+)
 
 type Column struct {
 	Name     string
@@ -22,9 +25,11 @@ type Result struct {
 }
 
 type Table struct {
-	schema  []Column
-	columns []tableColumn
-	rows    int
+	schema       []Column
+	columns      []tableColumn
+	rows         int
+	rowCacheOnce sync.Once
+	rowCache     []Row
 }
 
 func (t *Table) Schema() []Column {
@@ -40,15 +45,36 @@ func (t *Table) Len() int {
 	return t.rows
 }
 
+func (t *Table) materializedRows() []Row {
+	if t == nil {
+		return nil
+	}
+	t.rowCacheOnce.Do(func() {
+		rows := make([]Row, t.rows)
+		for i := 0; i < t.rows; i++ {
+			row := make(Row, len(t.columns))
+			for j, col := range t.columns {
+				row[j] = col.ValueAt(i)
+			}
+			rows[i] = row
+		}
+		t.rowCache = rows
+	})
+	return t.rowCache
+}
+
 type DB struct {
-	tables    map[string]*Table
-	functions map[string]ScalarFunction
+	tables     map[string]*Table
+	functions  map[string]ScalarFunction
+	cacheMu    sync.RWMutex
+	queryCache map[string]*PreparedQuery
 }
 
 func NewDB() *DB {
 	db := &DB{
-		tables:    make(map[string]*Table),
-		functions: make(map[string]ScalarFunction),
+		tables:     make(map[string]*Table),
+		functions:  make(map[string]ScalarFunction),
+		queryCache: make(map[string]*PreparedQuery),
 	}
 	db.registerBuiltinFunctions()
 	return db
